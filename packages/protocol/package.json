@@ -1,0 +1,18 @@
+{
+  "name": "@aftermath/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "After Math review protocol: file format, store, and diff engine",
+  "main": "out/index.js",
+  "types": "out/index.d.ts",
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

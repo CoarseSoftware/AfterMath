@@ -1,0 +1,9 @@
+node_modules/
+out/
+*.tsbuildinfo
+daemon/.state.json
+.aftermath/
+*.vsix
+# the packaged installer ships in the repo (CLI install without the store)
+!dist/
+!dist/*.vsix

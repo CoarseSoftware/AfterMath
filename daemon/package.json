@@ -1,0 +1,19 @@
+{
+  "name": "after-math-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "After Math daemon: polls review folders and fires notifications (toast + sound)",
+  "main": "out/watch.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsx src/watch.ts"
+  },
+  "dependencies": {
+    "@aftermath/protocol": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "name": "after-math",
+  "displayName": "After Math",
+  "description": "Local code review GUI for AI coding sessions (After Math by Coarse Software)",
+  "version": "0.1.0",
+  "publisher": "coarse-software",
+  "icon": "media/icon.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CoarseSoftware/AfterMath.git"
+  },
+  "private": true,
+  "engines": {
+    "vscode": "^1.138.0"
+  },
+  "categories": [
+    "SCM",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "files": [
+    "out/**/*",
+    "media/**/*",
+    "package.json"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "afterMath.openSession",
+        "title": "After Math: Open Review Session"
+      },
+      {
+        "command": "afterMath.refresh",
+        "title": "After Math: Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "afterMath.refresh",
+          "when": "view == afterMath.sessions",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "afterMath",
+          "title": "After Math",
+          "icon": "media/icon128.png"
+        }
+      ]
+    },
+    "views": {
+      "afterMath": [
+        {
+          "id": "afterMath.sessions",
+          "name": "Review Sessions",
+          "icon": "$(git-pull-request)"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "After Math",
+      "properties": {
+        "afterMath.watchedPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Directories scanned (shallow) for .aftermath/reviews folders. Defaults to the open workspace folders."
+        },
+        "afterMath.diffContext": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "description": "Context lines shown around each change."
+        },
+        "afterMath.hybridThreshold": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "Hybrid view: hunks with fewer than this many changed lines render stacked, larger hunks render side by side."
+        },
+        "afterMath.layoutMode": {
+          "type": "string",
+          "enum": ["unified", "side", "hybrid"],
+          "default": "unified",
+          "description": "Review layout: unified (inline), side-by-side, or hybrid. Global for all review panels; change it via the gear icon in a review."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "package:vsix": "node scripts/package.mjs"
+  },
+  "dependencies": {
+    "@aftermath/protocol": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.138.0",
+    "typescript": "^5.6.0"
+  }
+}

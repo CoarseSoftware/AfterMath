@@ -1,0 +1,6 @@
+{
+  "projectRoots": ["C:\\Users\\jacob\\source\\repos"],
+  "pollIntervalMs": 5000,
+  "toast": true,
+  "sound": true
+}

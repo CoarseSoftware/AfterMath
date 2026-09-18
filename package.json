@@ -1,0 +1,21 @@
+{
+  "name": "after-math",
+  "version": "0.1.0",
+  "private": true,
+  "description": "After Math by Coarse Software - local code reviewer for AI coding sessions",
+  "workspaces": [
+    "packages/*",
+    "daemon",
+    "extensions/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @aftermath/protocol && npm run build -w after-math-daemon && npm run compile -w after-math",
+    "test": "npm run test -w @aftermath/protocol",
+    "watch": "npm run watch -w after-math-daemon"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
