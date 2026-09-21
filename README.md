@@ -6,7 +6,7 @@
       <p>MIT Open Source License</p>
     </td>
     <td align="right" width="22%">
-      <img src="extensions/review-gui/media/icon.svg" width="140" alt="After Math icon">
+      <img src="extensions/review-gui/media/icon.svg" width="240" alt="After Math icon">
     </td>
   </tr>
 </table>
