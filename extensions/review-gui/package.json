@@ -2,7 +2,7 @@
   "name": "after-math",
   "displayName": "After Math",
   "description": "Local code review GUI for AI coding sessions (After Math by Coarse Software)",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "publisher": "coarse-software",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -37,6 +37,16 @@
         "command": "afterMath.refresh",
         "title": "After Math: Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "afterMath.file.setStatus",
+        "title": "Set File Status",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "afterMath.folder.setStatus",
+        "title": "Set Folder Status",
+        "icon": "$(checklist)"
       }
     ],
     "menus": {
@@ -45,6 +55,56 @@
           "command": "afterMath.refresh",
           "when": "view == afterMath.sessions",
           "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "afterMath.file.setStatus",
+          "when": "view == afterMath.sessions && viewItem == file",
+          "group": "status@1",
+          "title": "Needs review",
+          "icon": "$(circle-large-outline)",
+          "argument": "needs_review"
+        },
+        {
+          "command": "afterMath.file.setStatus",
+          "when": "view == afterMath.sessions && viewItem == file",
+          "group": "status@2",
+          "title": "In review",
+          "icon": "$(eye)",
+          "argument": "in_review"
+        },
+        {
+          "command": "afterMath.file.setStatus",
+          "when": "view == afterMath.sessions && viewItem == file",
+          "group": "status@3",
+          "title": "Accepted",
+          "icon": "$(check)",
+          "argument": "accepted"
+        },
+        {
+          "command": "afterMath.file.setStatus",
+          "when": "view == afterMath.sessions && viewItem == file",
+          "group": "status@4",
+          "title": "Rejected",
+          "icon": "$(x)",
+          "argument": "rejected"
+        },
+        {
+          "command": "afterMath.folder.setStatus",
+          "when": "view == afterMath.sessions && viewItem == folder",
+          "group": "status@1",
+          "title": "Accept all files in folder",
+          "icon": "$(check-all)",
+          "argument": "accepted"
+        },
+        {
+          "command": "afterMath.folder.setStatus",
+          "when": "view == afterMath.sessions && viewItem == folder",
+          "group": "status@2",
+          "title": "Un-accept all files in folder (back to needs review)",
+          "icon": "$(circle-large-outline)",
+          "argument": "needs_review"
         }
       ]
     },

@@ -37,6 +37,9 @@ export interface ReviewData {
   fileCounts: { accepted: number; total: number };
   /** Does THIS session (any file) still have open feedback? */
   sessionOpen: boolean;
+  /** The code reviewer (AI agent) that submitted this session — used to tag
+   *  discussion entries with a "Reviewer" / "You" indicator. */
+  sessionAgent: string;
 }
 
 const panels = new Map<string, vscode.WebviewPanel>();
@@ -44,6 +47,27 @@ let onSessionsChanged: (() => void) | undefined;
 
 export function setSessionsChangedListener(cb: () => void): void {
   onSessionsChanged = cb;
+}
+
+/** Push a quick status update (status pill / accept button / file counts /
+ *  ready state — NO diff recompute, NO session-wide git stats) into every
+ *  open review panel of the given session. Used right after a status change
+ *  so the UI flips instantly instead of waiting for the full data round-trip
+ *  (git base read + LCS diff + per-file git stats). The counts are read
+ *  straight from the session's JSON files (no git). */
+export function notifyPanels(sessionDir: string): void {
+  const counts = sessionFileCounts(sessionDir);
+  const sessionOpen = sessionHasOpen(sessionDir);
+  const prefix = sessionDir + '::';
+  for (const [key, panel] of [...panels]) {
+    if (!key.startsWith(prefix)) continue;
+    void panel.webview.postMessage({
+      type: 'quick',
+      file: undefined,
+      fileCounts: counts,
+      sessionOpen,
+    });
+  }
 }
 
 function repoRootOf(sessionDir: string): string {
@@ -117,8 +141,6 @@ export async function openReviewPanel(
   }
 
   const repoRoot = repoRootOf(sessionDir);
-  const baseLines = (await getBaseLines(repoRoot, manifest.baseRef, filePath)) ?? [];
-  const currentLines = getCurrentLines(repoRoot, filePath);
   const context = vscode.workspace
     .getConfiguration('afterMath')
     .get<number>('diffContext', 3);
@@ -146,17 +168,32 @@ export async function openReviewPanel(
     fileName: filePath,
     sessionDir,
     file: load(),
-    blocks: computeBlocks(baseLines, currentLines, context),
+    blocks: [],
     author,
     hybridThreshold: threshold,
     layoutMode: layoutMode(),
-    fileStats: statsOf(computeBlocks(baseLines, currentLines, context)),
+    fileStats: { added: 0, removed: 0 },
     sessionStats: { added: 0, removed: 0 },
     fileCounts: sessionFileCounts(sessionDir),
     sessionOpen: sessionHasOpen(sessionDir),
+    sessionAgent: manifest.agent ?? '',
   };
-  // Session totals are async (they git-show every file); fill them in before
-  // the first send so the webview never shows a stale zero total.
+  // The diff (blocks + file stats) is recomputed on demand: it changes every
+  // time the agent edits the file, so it must be re-derived, not cached.
+  const refreshDiff = async (): Promise<void> => {
+    const base = (await getBaseLines(repoRoot, manifest.baseRef, filePath)) ?? [];
+    const cur = getCurrentLines(repoRoot, filePath);
+    const blocks = computeBlocks(base, cur, context);
+    data.blocks = blocks;
+    data.fileStats = statsOf(blocks);
+  };
+  // The diff needs a git subprocess round-trip (git show baseRef) + an LCS
+  // pass — don't hold the panel open on it: the webview is created FIRST
+  // (with a loading state) and the data arrives a moment later. Session
+  // totals (a git show per file) run in the background the same way.
+  void refreshDiff().catch(() => {
+    /* git hiccup — the next send will retry */
+  });
   void sessionStats(repoRoot, manifest, context).then((s) => {
     data.sessionStats = s;
   });
@@ -184,12 +221,20 @@ export async function openReviewPanel(
 
   // The webview's script may not be executing yet when we first post; it
   // announces readiness and we (re)send the data at that point.
-  const send = () => {
+  const send = async (): Promise<void> => {
     if (disposed) return;
     data.file = load();
     data.layoutMode = layoutMode();
     data.fileCounts = sessionFileCounts(sessionDir);
     data.sessionOpen = sessionHasOpen(sessionDir);
+    // Re-derive the diff so the view tracks the file on disk (the agent may
+    // have edited it since the last send).
+    try {
+      await refreshDiff();
+    } catch {
+      /* git hiccup — keep the previously computed blocks */
+    }
+    if (disposed) return;
     // Keep the session totals fresh without blocking the send: refresh in the
     // background and re-send once the git show round-trips are done.
     void sessionStats(repoRoot, manifest, context).then((s) => {
@@ -200,7 +245,58 @@ export async function openReviewPanel(
     });
     void panel.webview.postMessage({ type: 'data', data });
   };
-  send();
+
+  // Quick status push for THIS panel: flip the status UI in the webview
+  // WITHOUT recomputing the diff or the session-wide git stats — that full
+  // data round-trip is what made the Accept button feel slow. The host's
+  // acceptFile/setReady handlers call this, and notifyPanels() covers the
+  // other panels of the session (e.g. right-click status changes from the
+  // left panel, or another file's accept flipping the shared counters).
+  const sendQuick = (): void => {
+    if (disposed) return;
+    data.file = load();
+    data.fileCounts = sessionFileCounts(sessionDir);
+    data.sessionOpen = sessionHasOpen(sessionDir);
+    void panel.webview.postMessage({
+      type: 'quick',
+      file: data.file,
+      fileCounts: data.fileCounts,
+      sessionOpen: data.sessionOpen,
+    });
+  };
+
+  // Live updates: the agent edits the reviewed source file(s) and re-writes
+  // the review JSONs on disk (fixes, replies, re-submissions). Watching both
+  // the session folder and the file itself lets the panel refresh by itself
+  // instead of waiting for a VS Code reload. Debounced — the agent often
+  // rewrites several files back to back.
+  const watchers: vscode.FileSystemWatcher[] = [
+    // Glob separators are forward slashes even on Windows.
+    vscode.workspace.createFileSystemWatcher(sessionDir.replace(/\\/g, '/') + '/**'),
+    vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(repoRoot, filePath.replace(/\\/g, '/'))
+    ),
+  ];
+  let pendingSend: NodeJS.Timeout | undefined;
+  const onDiskChange = (): void => {
+    if (disposed) return;
+    if (pendingSend) clearTimeout(pendingSend);
+    pendingSend = setTimeout(() => {
+      pendingSend = undefined;
+      void send();
+      onSessionsChanged?.();
+    }, 600);
+  };
+  for (const w of watchers) {
+    w.onDidCreate(onDiskChange);
+    w.onDidChange(onDiskChange);
+    w.onDidDelete(onDiskChange);
+  }
+  panel.onDidDispose(() => {
+    if (pendingSend) clearTimeout(pendingSend);
+    for (const w of watchers) void w.dispose();
+  });
+  void send();
 
   panel.webview.onDidReceiveMessage(async (msg: {
     type: string;
@@ -215,7 +311,7 @@ export async function openReviewPanel(
     mode?: string;
   }) => {
     if (msg.type === 'ready') {
-      send();
+      void send();
       return;
     }
     try {
@@ -223,6 +319,10 @@ export async function openReviewPanel(
       const fr = load();
       const now = new Date().toISOString();
       let notify = false;
+      // Status-only changes (accept/ready) skip the full send: the status UI
+      // flips instantly via sendQuick(), and the file watcher already
+      // schedules the full (diff + stats) refresh a beat later.
+      let quick = false;
       switch (msg.type) {
         case 'addComment': {
           const c: ReviewComment = {
@@ -291,6 +391,20 @@ export async function openReviewPanel(
             fr.updatedAt = now;
             writeFileReview(sessionDir, fr);
             notify = true;
+            quick = true;
+          }
+          break;
+        }
+        case 'unanswerDiscussion': {
+          // Re-open an answered entry (the green "✓ answered" pill) so the
+          // human can add to it or change their mind.
+          const d = fr.discussion.find((x) => x.id === msg.id);
+          if (d && d.answered) {
+            d.answered = false;
+            fr.updatedAt = now;
+            writeFileReview(sessionDir, fr);
+            notify = true;
+            quick = true;
           }
           break;
         }
@@ -309,16 +423,22 @@ export async function openReviewPanel(
           fr.updatedAt = now;
           writeFileReview(sessionDir, fr);
           notify = true;
+          quick = true;
           break;
         }
         case 'acceptFile': {
           // Per-file: toggle accepted. Accepting does NOT release the agent —
           // it keeps waiting until the review is committed or a file is
           // revised. Un-accepting sends the file back to needs review.
-          fr.status = msg.accept === false ? 'needs_review' : 'accepted';
+          const accept = msg.accept !== false;
+          fr.status = accept ? 'accepted' : 'needs_review';
+          // Accepting acknowledges the agent's changes — clear the "changed by
+          // the agent" flag so the left panel stops highlighting it.
+          if (accept) fr.agentTouched = false;
           fr.updatedAt = now;
           writeFileReview(sessionDir, fr);
           notify = true;
+          quick = true;
           break;
         }
         case 'requestRevision': {
@@ -331,15 +451,13 @@ export async function openReviewPanel(
           break;
         }
         case 'commitChanges': {
-          // Session-level: every file is accepted — but only when the whole
-          // session has no open feedback (authoritative disk read). The
-          // human's commit options are recorded in the manifest for the agent.
+          // Session-level: "Commit changes" is available AT ANY TIME. The
+          // webview shows "n of m files accepted" in the dialog and asks
+          // before committing; committing accepts every remaining file (the
+          // human explicitly chose "commit all"). The human's commit options
+          // are recorded in the manifest for the agent.
           const session = readSession(sessionDir);
           if (!session) break;
-          if (sessionHasOpenFeedback(session)) {
-            void panel.webview.postMessage({ type: 'prBlocked', reason: 'open-feedback' });
-            return;
-          }
           const commit: CommitOptions = {
             mode: msg.commit?.mode === 'pr' ? 'pr' : 'local',
             ...(typeof msg.commit?.branch === 'string' && msg.commit.branch.trim() !== ''
@@ -359,7 +477,7 @@ export async function openReviewPanel(
             await vscode.workspace
               .getConfiguration('afterMath')
               .update('layoutMode', msg.mode, vscode.ConfigurationTarget.Workspace);
-            send();
+            await send();
           }
           return;
         }
@@ -367,8 +485,15 @@ export async function openReviewPanel(
           return;
       }
       if (notify) {
-        send();
         onSessionsChanged?.();
+        if (quick) {
+          // Status UI flips now (this panel + every other panel of the
+          // session); the full data send rides on the file-watcher refresh.
+          sendQuick();
+          notifyPanels(sessionDir);
+        } else {
+          await send();
+        }
       }
     } catch (err) {
       void vscode.window.showErrorMessage(`After Math: ${String(err)}`);
@@ -404,9 +529,15 @@ function buildHtml(): string {
   html, body { margin: 0; height: 100%; }
   body { display: flex; flex-direction: column; font-family: var(--vscode-font-family, sans-serif); font-size: 13px; color: var(--fg); background: var(--bg); }
 
-  #toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
-  #toolbar .fname { font-weight: 600; margin-right: 4px; }
-  #statusChip { padding: 1px 8px; border-radius: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+  /* Two-row header: row 1 = file name + status pill, row 2 = the action
+     buttons. Kept on separate rows so a long file name can never push the
+     buttons off the line. */
+  #toolbar { display: flex; flex-direction: column; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  #toolbar .trow { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+  #toolbar .fname { font-weight: 600; margin-right: 4px; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #toolbar .trow-head #statusChip { flex: 0 0 auto; }
+  #statusChip { padding: 1px 8px; border-radius: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; flex: 0 0 auto; }
+  .aichip { padding: 1px 8px; border-radius: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; flex: 0 0 auto; background: #4a3a7a66; color: #c3a6ff; }
   .chip-needs_review { background: #8a6d1a66; color: #e0b341; }
   .chip-in_review { background: #2a5a8a66; color: #6cb6ff; }
   .chip-accepted { background: #2a7a2a66; color: #6fce6f; }
@@ -416,7 +547,9 @@ function buildHtml(): string {
   button.active { outline: 1px solid var(--fg); }
   button:disabled { opacity: 0.45; cursor: default; }
   button.acceptbtn { color: var(--add-fg); }
-  button.revise { color: var(--del-fg); }
+  /* "Revise all" matches the per-file Revise button (blue), not the red of a
+     plain "revise" action — it is the same release action, applied to all. */
+  button.revise { color: #6cb6ff; }
   button.pr { color: var(--add-fg); }
   button.readybtn { color: #6cb6ff; }
   button.readybtn.on { background: #2a5a8a66; color: #6cb6ff; outline: 1px solid #6cb6ff; }
@@ -427,7 +560,7 @@ function buildHtml(): string {
   button.gear { font-size: 14px; padding: 0 7px; line-height: 18px; }
   button.gear.on { outline: 1px solid var(--fg); }
   /* Settings menu: fixed so it stays visible while the diff is scrolled. */
-  .settingsmenu { position: fixed; top: 44px; right: 8px; width: 280px; z-index: 60; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid #6cb6ff; border-radius: 3px; padding: 8px 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+  .settingsmenu { position: fixed; top: 74px; right: 8px; width: 280px; z-index: 60; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid #6cb6ff; border-radius: 3px; padding: 8px 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
   .settingsmenu .settingsmenu-header { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #888; margin-bottom: 6px; }
   .settingsmenu .settings-sub { border: 1px solid var(--border); border-radius: 3px; padding: 6px; }
   .settingsmenu .settings-sublabel { display: block; font-size: 11px; color: var(--fg); margin-bottom: 4px; }
@@ -481,7 +614,7 @@ function buildHtml(): string {
 
   /* Inline confirm/note dialog: fixed so it is always visible, contents
      right-aligned. */
-  .dialogbar { position: fixed; top: 44px; right: 8px; left: auto; width: 440px; max-width: calc(100% - 16px); z-index: 50; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid #6cb6ff; border-radius: 3px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); text-align: right; }
+  .dialogbar { position: fixed; top: 74px; right: 8px; left: auto; width: 440px; max-width: calc(100% - 16px); z-index: 50; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid #6cb6ff; border-radius: 3px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); text-align: right; }
   .dialogbar h4 { margin: 0 0 8px 0; font-size: 12px; color: var(--fg); text-align: right; line-height: 1.5; }
   .dialogbar .actions { display: flex; gap: 6px; justify-content: flex-end; }
   .dialogbar .opt { display: flex; align-items: center; gap: 6px; margin: 5px 0; font-size: 12.5px; }
@@ -500,28 +633,64 @@ function buildHtml(): string {
   .editor textarea { width: 100%; min-height: 44px; margin-top: 6px; background: var(--vscode-input-background, #2a2a2a); color: var(--fg); border: 1px solid var(--border); font-family: inherit; font-size: 12.5px; padding: 5px; resize: vertical; }
   .editor .actions { display: flex; gap: 6px; margin-top: 6px; }
 
+  /* The agent's brief reply, shown under the comment / discussion it answers. */
+  .reply { margin-top: 6px; padding: 5px 7px; background: rgba(127,106,180,0.12); border-left: 2px solid #8b6fd0; border-radius: 2px; font-size: 12.5px; color: var(--fg); }
+  .reply .replylabel { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: #b79bf0; margin-right: 5px; }
+  .reply .replyat { color: #888; font-size: 11px; margin-left: 4px; }
+
+  /* "Revised" pill: the agent changed the code in response to this comment
+     / discussion entry. Sits inline next to the text. */
+  .pill-revised { display: inline-block; vertical-align: 1px; margin-left: 6px; padding: 0 7px; border-radius: 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; background: #2a5a8a66; color: #6cb6ff; }
+
   #discussion { border-top: 1px solid var(--border); padding: 8px 10px; max-height: 40%; overflow: auto; }
   #discussion h4 { margin: 0 0 6px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #888; }
-  #discussion .ditem { margin: 5px 0; font-size: 12.5px; }
+  #discussion .ditem { margin: 6px 0; padding: 6px 0; font-size: 12.5px; border-top: 1px solid var(--border); }
+  #discussion .ditem:first-child { border-top: none; padding-top: 2px; }
+  #discussion .ditem.answered { opacity: 0.7; }
   #discussion .dmeta { color: #888; font-size: 11px; }
+  #discussion .answerbtn { color: var(--add-fg); font-weight: 700; padding: 0 6px; }
+  #discussion .answerpill { color: var(--add-fg); background: rgba(111,206,111,0.15); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; padding: 1px 7px; border-radius: 8px; }
+  #discussion .answerpill:hover { background: rgba(111,206,111,0.3); }
   #discussion textarea { width: 100%; min-height: 34px; margin-top: 6px; background: var(--vscode-input-background, #2a2a2a); color: var(--fg); border: 1px solid var(--border); font-family: inherit; font-size: 12.5px; padding: 5px; resize: vertical; }
+
+  /* Who spoke: a pill in front of each discussion entry — purple (robot +
+     the agent's name) for the AI agent, blue for you. */
+  .who { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; padding: 1px 7px; border-radius: 8px; margin-right: 6px; vertical-align: 1px; white-space: nowrap; }
+  .who.agent { background: #4a3a7a66; color: #c3a6ff; }
+  .who.agent .robot { flex: 0 0 auto; }
+  .who.human { background: #2a5a8a66; color: #6cb6ff; }
+
+  /* Shown until the first data message arrives (the diff needs a git
+     round-trip, so the panel opens first and fills in a moment later). */
+  #loading { padding: 24px 12px; color: #888; font-size: 12.5px; }
+
+  /* "n of m files accepted" line in the commit dialog: red-ish when some
+     files are still un-accepted, green-ish when everything is accepted. */
+  .commitnote { font-size: 12px; margin: 6px 0; }
+  .commitnote.warn { color: var(--del-fg); }
+  .commitnote.ok { color: var(--add-fg); }
 </style>
 </head>
 <body>
   <div id="toolbar">
-    <span class="fname" id="fname"></span>
-    <button id="btnAccept" class="acceptbtn" title="Accept THIS file. The agent is NOT released — it keeps waiting until the whole review is committed (or you revise a file).">Accept</button>
-    <button id="btnReady" class="readybtn" title="Release THIS file to the agent: it will start working on this file's open comments right away, without waiting for the rest of the review. Click again to take it back.">Revise</button>
-    <span id="fileStats" class="stats" title="Added and removed lines in THIS file"></span>
-    <span id="sessionStats" class="stats muted" title="Added and removed lines across the whole review"></span>
-    <span id="fileCounts" class="stats muted" title="Files accepted / total files in this review"></span>
-    <span id="statusChip"></span>
-    <span class="spacer"></span>
-    <span class="sessiongroup">
-      <button id="btnRevise" class="revise" title="Release every file in this review that has open comments or discussion. The agent will start working on all of them at once and wait for your review of the result.">Revise all</button>
-      <button id="btnPR" class="pr" title="Mark the whole review accepted. The agent will then commit the changes — to a local branch or as a pull request, your choice in the dialog. Only available when every comment is resolved.">Commit changes</button>
-    </span>
-    <button id="btnSettings" class="gear" title="Review settings">⚙</button>
+    <div class="trow trow-head">
+      <span class="fname" id="fname"></span>
+      <span id="aiChip" class="aichip" hidden title="The agent changed this file since you last reviewed it — it has replied to your feedback.">✦ AI updated</span>
+      <span id="statusChip"></span>
+    </div>
+    <div class="trow trow-actions">
+      <button id="btnAccept" class="acceptbtn" title="Accept THIS file. The agent is NOT released — it keeps waiting until the whole review is committed (or you revise a file).">Accept</button>
+      <button id="btnReady" class="readybtn" title="Release THIS file to the agent: it will start working on this file's open comments right away, without waiting for the rest of the review. Click again to take it back.">Revise</button>
+      <span id="fileStats" class="stats" title="Added and removed lines in THIS file"></span>
+      <span id="sessionStats" class="stats muted" title="Added and removed lines across the whole review"></span>
+      <span id="fileCounts" class="stats muted" title="Files accepted / total files in this review"></span>
+      <span class="spacer"></span>
+      <span class="sessiongroup">
+        <button id="btnRevise" class="revise" title="Release every file in this review that has open comments or discussion. The agent will start working on all of them at once and wait for your review of the result.">Revise all</button>
+        <button id="btnPR" class="pr" title="Let the agent commit the changes — to a local branch or as a pull request, your choice in the dialog. Available at any time; files you have not accepted yet are accepted too, after you confirm.">Commit changes</button>
+      </span>
+      <button id="btnSettings" class="gear" title="Review settings">⚙</button>
+    </div>
   </div>
   <div id="settingsMenu" class="settingsmenu" hidden>
     <div class="settingsmenu-header">Settings</div>
@@ -534,7 +703,7 @@ function buildHtml(): string {
       </div>
     </div>
   </div>
-  <div id="content"></div>
+  <div id="content"><div id="loading">Loading review…</div></div>
   <div id="discussion">
     <h4>Discussion</h4>
     <div id="dList"></div>
@@ -668,13 +837,27 @@ function buildHtml(): string {
     ok.onclick = closeDialog;
   }
 
-  // The "Commit changes" dialog: choose local commit or pull request, an
-  // optional new branch, and (PR only) whether to squash into one commit.
+  // The "Commit changes" dialog: always available. Shows how many files are
+  // accepted ("n of m"); when not all are, it warns that the remaining ones
+  // will be accepted too and asks for confirmation. Then: local commit or
+  // pull request, an optional new branch, and (PR only) whether to squash.
   function commitDialog() {
     closeDialog();
     const bar = document.createElement('div');
     bar.className = 'dialogbar';
-    bar.innerHTML = '<h4>Commit the changes? Every file in this review is accepted and the agent commits them the way you choose below.</h4>';
+    const counts = data.fileCounts || { accepted: 0, total: 0 };
+    const allAccepted = counts.accepted >= counts.total;
+    const h4 = document.createElement('h4');
+    h4.textContent = allAccepted
+      ? 'Commit the changes? Every file in this review is accepted and the agent commits them the way you choose below.'
+      : 'Commit the changes? Only ' + counts.accepted + ' of ' + counts.total + ' files are accepted — committing accepts the remaining ' + (counts.total - counts.accepted) + ' file(s) as well and the agent commits everything.';
+    bar.appendChild(h4);
+    const note = document.createElement('div');
+    note.className = 'commitnote ' + (allAccepted ? 'ok' : 'warn');
+    note.textContent = allAccepted
+      ? counts.accepted + ' / ' + counts.total + ' files accepted'
+      : counts.accepted + ' / ' + counts.total + ' files accepted — ' + (counts.total - counts.accepted) + ' will be accepted now';
+    bar.appendChild(note);
     const optLocal = document.createElement('div');
     optLocal.className = 'opt';
     optLocal.innerHTML = '<label><input type="radio" name="commitMode" value="local" checked title="Commit to a local branch and stop there"> Commit to local branch</label>';
@@ -694,7 +877,7 @@ function buildHtml(): string {
     const actions = document.createElement('div');
     actions.className = 'actions';
     const go = document.createElement('button');
-    go.textContent = 'Commit';
+    go.textContent = allAccepted ? 'Commit' : 'Accept all & commit';
     go.title = 'Accept every file and let the agent commit the changes';
     const cancel = document.createElement('button');
     cancel.textContent = 'Cancel';
@@ -713,11 +896,11 @@ function buildHtml(): string {
       };
     });
     go.onclick = () => {
-      const mode = bar.querySelector('input[name="commitMode"]:checked').value;
+      const commitMode = bar.querySelector('input[name="commitMode"]:checked').value;
       const branch = branchInput.value.trim();
-      const squash = mode === 'pr' && squashInput.checked;
+      const squash = commitMode === 'pr' && squashInput.checked;
       closeDialog();
-      post({ type: 'commitChanges', commit: { mode: mode, branch: branch, squash: squash } });
+      post({ type: 'commitChanges', commit: { mode: commitMode, branch: branch, squash: squash } });
     };
     cancel.onclick = closeDialog;
   }
@@ -736,7 +919,15 @@ function buildHtml(): string {
       .forEach((c) => {
         const item = document.createElement('div');
         item.className = 'item' + (c.resolved ? ' resolved' : '');
-        let html = esc(c.text) + '<div class="meta">' + esc(c.author) + ' · ' + new Date(c.createdAt).toLocaleString() + (c.resolved ? ' · resolved' : '') + '</div>';
+        const revisedPill = c.revised === true
+          ? '<span class="pill-revised" title="The agent revised the code in response to this comment">Revised</span>'
+          : '';
+        let html = esc(c.text) + revisedPill + '<div class="meta">' + esc(c.author) + ' · ' + new Date(c.createdAt).toLocaleString() + (c.resolved ? ' · resolved' : '') + (c.revised === true ? ' · revised by agent' : '') + '</div>';
+        if (c.reply) {
+          // The agent's brief reply (1–3 sentences on what it changed).
+          html += '<div class="reply"><span class="replylabel">Agent</span> ' + esc(c.reply) +
+            (c.replyAt ? ' <span class="replyat">' + new Date(c.replyAt).toLocaleString() + '</span>' : '') + '</div>';
+        }
         if (c.resolved) {
           // Resolved: no action buttons, just a pencil to reopen/edit.
           html += '<div class="itemactions"><button class="editc" data-id="' + c.id + '" title="Edit this comment (reopens it)">&#9998;</button></div>';
@@ -825,25 +1016,32 @@ function buildHtml(): string {
       commentBoxes = new Map();
       byLine.forEach((_, line) => commentBoxes.set(line, true));
     }
-    // Lines that no longer have any comment don't keep a box.
-    commentBoxes.forEach((_, line) => {
-      if (!byLine.has(line)) commentBoxes.delete(line);
+    // Lines that no longer have any comment don't keep a box — unless the
+    // user explicitly opened one (via the + button) so they can add a first
+    // comment. The box disappears once it is closed or the line goes away.
+    commentBoxes.forEach((open, line) => {
+      if (!byLine.has(line) && open !== true) commentBoxes.delete(line);
     });
-    byLine.forEach((comments, line) => {
+    // Every line whose box is open gets the box — including lines with no
+    // comment yet (that is exactly what the + button is for).
+    const openLines = new Set();
+    commentBoxes.forEach((open, line) => { if (open === true) openLines.add(line); });
+    openLines.forEach((line) => {
+      const comments = byLine.get(line) ?? [];
       const row = document.querySelector('[data-newline="' + line + '"]');
-      if (!row) return;
+      if (!row) { commentBoxes.delete(line); return; }
       const gutter = row.querySelector('.gutter');
-      const open = comments.filter((c) => !c.resolved).length;
-      const badge = document.createElement('span');
-      badge.className = 'badge' + (open === 0 ? ' resolved' : '');
-      badge.textContent = String(comments.length);
-      badge.title = comments.map((c) => (c.resolved ? '[resolved] ' : '') + c.text).join('\\n');
-      const isOpen = commentBoxes.get(line) === true;
-      badge.onclick = (e) => { e.stopPropagation(); setLineOpen(line, !isOpen); };
-      gutter.appendChild(badge);
-      if (isOpen) {
-        row.insertAdjacentElement('afterend', buildEditorBox(line));
+      if (comments.length > 0 && gutter) {
+        const open = comments.filter((c) => !c.resolved).length;
+        const badge = document.createElement('span');
+        badge.className = 'badge' + (open === 0 ? ' resolved' : '');
+        badge.textContent = String(comments.length);
+        badge.title = comments.map((c) => (c.resolved ? '[resolved] ' : '') + c.text).join('\\n');
+        const isOpen = commentBoxes.get(line) === true;
+        badge.onclick = (e) => { e.stopPropagation(); setLineOpen(line, !isOpen); };
+        gutter.appendChild(badge);
       }
+      row.insertAdjacentElement('afterend', buildEditorBox(line));
     });
   }
 
@@ -877,37 +1075,80 @@ function buildHtml(): string {
     list.innerHTML = '';
     data.file.discussion.forEach((d) => {
       const div = document.createElement('div');
-      div.className = 'ditem';
-      let html = esc(d.text) + ' <span class="dmeta">— ' + esc(d.author) + ' · ' + new Date(d.createdAt).toLocaleString() + (d.answered ? ' · answered' : '') + '</span>';
-      if (!d.answered) {
-        html += ' <button data-dact="answer" data-id="' + d.id + '" title="Mark this discussion entry as answered">✓</button>';
+      div.className = 'ditem' + (d.answered ? ' answered' : '');
+      const revisedPill = d.revised === true
+        ? '<span class="pill-revised" title="The agent revised the code in response to this entry">Revised</span>'
+        : '';
+      // Who wrote this entry: the AI agent (robot + its name) or you.
+      const who = isAgentAuthor(d.author)
+        ? '<span class="who agent" title="Written by the AI agent">' + robotIcon() + '<span class="who-name">' + esc(agentDisplayName()) + '</span></span>'
+        : '<span class="who human" title="Written by you">You</span>';
+      let html = who + esc(d.text) + revisedPill + ' <span class="dmeta">— ' + esc(d.author) + ' · ' + new Date(d.createdAt).toLocaleString() + (d.answered ? ' · answered' : '') + (d.revised === true ? ' · revised by agent' : '') + '</span>';
+      if (d.answered) {
+        // Visible "answered" indicator (green pill); clicking it re-opens
+        // the entry (back to unanswered).
+        html += ' <button class="answerpill" data-dact="unanswer" data-id="' + d.id + '" title="Answered — click to open this entry again">✓ answered</button>';
+      } else {
+        html += ' <button data-dact="answer" data-id="' + d.id + '" class="answerbtn" title="Mark this discussion entry as answered">✓</button>';
+      }
+      if (d.reply) {
+        // The agent's brief reply to this entry.
+        html += '<div class="reply"><span class="replylabel">Agent</span> ' + esc(d.reply) +
+          (d.replyAt ? ' <span class="replyat">' + new Date(d.replyAt).toLocaleString() + '</span>' : '') + '</div>';
       }
       div.innerHTML = html;
       list.appendChild(div);
     });
   }
 
+  // Is this author the session's code reviewer (the AI agent)? Compared
+  // case-insensitively on the account part ("claude@devbox" matches "claude").
+  function isAgentAuthor(author) {
+    const agent = (data.sessionAgent || '').trim().toLowerCase();
+    const a = String(author || '').trim().toLowerCase();
+    if (!agent || !a) return false;
+    if (a === agent) return true;
+    return a.split('@')[0] === agent.split('@')[0];
+  }
+
+  // The agent's display name for the pill: the manifest's agent value with
+  // any "@host" suffix dropped (falls back to "Agent" when the manifest has
+  // no agent name).
+  function agentDisplayName() {
+    const raw = (data.sessionAgent || '').trim().split('@')[0];
+    return raw || 'Agent';
+  }
+
+  // Small inline robot (the webview is self-contained — no codicon font).
+  function robotIcon() {
+    return '<svg class="robot" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true">' +
+      '<rect x="2.5" y="4.5" width="11" height="9" rx="1.6" fill="currentColor"/>' +
+      '<rect x="4.4" y="6.9" width="2.4" height="2.4" rx="0.7" fill="#1e1e1e"/>' +
+      '<rect x="9.2" y="6.9" width="2.4" height="2.4" rx="0.7" fill="#1e1e1e"/>' +
+      '<rect x="5.4" y="10.6" width="5.2" height="1.1" rx="0.55" fill="#1e1e1e"/>' +
+      '<path d="M8 2.6v1.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" fill="none"/>' +
+      '<circle cx="8" cy="2.1" r="1.15" fill="currentColor"/>' +
+      '</svg>';
+  }
+
   function statsSpan(s) {
     return '<span class="add">+' + s.added + '</span> <span class="del">-' + s.removed + '</span>';
   }
 
-  function render() {
-    if (!data) return;
-    document.getElementById('fname').textContent = data.fileName;
-    document.getElementById('fileStats').innerHTML = statsSpan(data.fileStats);
-    document.getElementById('sessionStats').innerHTML =
-      '(' + statsSpan(data.sessionStats) + ')';
+  // The status UI only (status pill, accept/revise buttons, file counters,
+  // AI-updated chip) — factored out of render() so the host's quick status
+  // push can flip it WITHOUT re-rendering the diff.
+  function applyStatusUi() {
     document.getElementById('fileCounts').innerHTML =
       data.fileCounts
         ? '<span class="add">' + data.fileCounts.accepted + '</span>/' + data.fileCounts.total + ' files'
         : '';
-    // Keep the settings select in sync with the (global) layout preference.
-    document.querySelectorAll('#settingsMenu [data-mode]').forEach((b) => {
-      b.classList.toggle('active', b.getAttribute('data-mode') === mode);
-    });
     const chip = document.getElementById('statusChip');
     chip.textContent = data.file.status.replace('_', ' ');
     chip.className = 'chip-' + data.file.status;
+    // "AI updated" marker: the agent changed this file since the last review.
+    document.getElementById('aiChip').hidden =
+      !(data.file.agentTouched === true && data.file.status !== 'accepted');
     const readyBtn = document.getElementById('btnReady');
     const on = data.file.ready === true;
     readyBtn.classList.toggle('on', on);
@@ -919,15 +1160,27 @@ function buildHtml(): string {
     acceptBtn.title = isAccepted
       ? 'This file is accepted. Click to un-accept it (back to needs review).'
       : 'Accept THIS file. The agent keeps waiting until the whole review is committed (or you revise a file).';
-    // Session-level button: "Commit changes" targets the WHOLE session —
-    // it is only clickable when NO file in this session (not just this
-    // file) has open feedback. The host re-checks before acting.
+    // Session-level button: "Commit changes" is ALWAYS clickable — the
+    // dialog shows "n of m files accepted" and asks before committing
+    // everything. The host accepts any remaining files on confirm.
     const prBtn = document.getElementById('btnPR');
-    const sessionOpen = data.sessionOpen !== false;
-    prBtn.disabled = sessionOpen;
-    prBtn.title = sessionOpen
-      ? 'Resolve all comments and discussion in every file of this review first.'
-      : 'Mark the whole review accepted — the agent will then commit the changes, to a local branch or as a pull request (your choice in the dialog).';
+    prBtn.disabled = false;
+    prBtn.title = 'Let the agent commit the changes — to a local branch or as a pull request (your choice in the dialog). Files you have not accepted yet are accepted too, after you confirm.';
+  }
+
+  function render() {
+    if (!data) return;
+    const loading = document.getElementById('loading');
+    if (loading) loading.remove();
+    document.getElementById('fname').textContent = data.fileName;
+    document.getElementById('fileStats').innerHTML = statsSpan(data.fileStats);
+    document.getElementById('sessionStats').innerHTML =
+      '(' + statsSpan(data.sessionStats) + ')';
+    // Keep the settings select in sync with the (global) layout preference.
+    document.querySelectorAll('#settingsMenu [data-mode]').forEach((b) => {
+      b.classList.toggle('active', b.getAttribute('data-mode') === mode);
+    });
+    applyStatusUi();
     const content = document.getElementById('content');
     content.innerHTML = '';
     const ctxRow = (l) => rowLine('ctx', l.no, l.text, '', true);
@@ -977,7 +1230,10 @@ function buildHtml(): string {
     renderDiscussion();
   }
 
-  document.getElementById('content').addEventListener('click', (e) => {
+  // Delegated from document.body (NOT just #content): the "answer" button
+  // lives in the #discussion box, which is a sibling of #content — listening
+  // on #content alone made the ✓ button a dead click.
+  document.body.addEventListener('click', (e) => {
     const t = e.target;
     const el = t instanceof Element ? t : null;
     if (!el) return;
@@ -1006,6 +1262,11 @@ function buildHtml(): string {
     const ans = el.closest('[data-dact="answer"]');
     if (ans) {
       post({ type: 'answerDiscussion', id: ans.getAttribute('data-id') });
+      return;
+    }
+    const unans = el.closest('[data-dact="unanswer"]');
+    if (unans) {
+      post({ type: 'unanswerDiscussion', id: unans.getAttribute('data-id') });
       return;
     }
   });
@@ -1085,11 +1346,22 @@ function buildHtml(): string {
       reanchorStaleComments();
       render();
     }
+    if (msg.type === 'quick') {
+      // Fast status push from the host (accept/ready/answer/resolve or a
+      // right-click status): flip the status UI + discussion NOW — no diff
+      // recompute, no re-render of the code. The full data message follows
+      // shortly via the file watcher.
+      if (!data) return;
+      if (msg.file) {
+        data.file = msg.file;
+        renderDiscussion();
+      }
+      if (msg.fileCounts) data.fileCounts = msg.fileCounts;
+      if (typeof msg.sessionOpen === 'boolean') data.sessionOpen = msg.sessionOpen;
+      applyStatusUi();
+    }
     if (msg.type === 'readyBlocked') {
       note(msg.reason === 'no-feedback' ? 'Add a comment or a discussion entry to this file first — Revise releases your feedback to the agent, so there is nothing to release yet.' : 'This file cannot be released to the agent right now.');
-    }
-    if (msg.type === 'prBlocked') {
-      note('Some file in this review still has an unresolved comment or unanswered discussion. Resolve everything, then commit the changes.');
     }
     if (msg.type === 'sessionUpdated') {
       if (msg.commit && msg.commit.mode === 'pr') {

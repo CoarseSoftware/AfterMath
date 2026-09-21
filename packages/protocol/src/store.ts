@@ -90,6 +90,8 @@ export function applyCommit(
   for (const fr of session.files) {
     fr.status = 'accepted';
     fr.ready = false;
+    // The agent's changes are now accepted — drop the "changed by agent" flag.
+    fr.agentTouched = false;
     fr.updatedAt = updatedAt;
     writeFileReview(sessionDir, fr);
     accepted += 1;

@@ -20,6 +20,22 @@ export interface ReviewComment {
   resolved: boolean;
   /** Set when the human edits the comment text. */
   updatedAt?: string;
+  /**
+   * The agent's brief reply, set when it addresses the comment. Kept short on
+   * purpose: 1–3 sentences describing what it changed. Absent until the agent
+   * responds.
+   */
+  reply?: string;
+  /** ISO 8601 time the agent wrote {@link reply}. */
+  replyAt?: string;
+  /**
+   * Agent-written: `true` when the agent changed the code in response to this
+   * comment (as opposed to just replying to push back or ask a question).
+   * The GUI shows such comments with a "revised" pill in the code view and
+   * flags the file with a distinct "revised" icon in the left panel. Absent
+   * until the agent sets it; the human's Accept clears it implicitly.
+   */
+  revised?: boolean;
 }
 
 export interface DiscussionEntry {
@@ -28,6 +44,20 @@ export interface DiscussionEntry {
   author: string;
   createdAt: string;
   answered: boolean;
+  /**
+   * The agent's brief reply to this discussion entry (a change request or an
+   * answer to a question). 1–3 sentences. Absent until the agent responds.
+   */
+  reply?: string;
+  /** ISO 8601 time the agent wrote {@link reply}. */
+  replyAt?: string;
+  /**
+   * Agent-written: `true` when the agent changed the code in response to this
+   * discussion entry (a change request it acted on). Not set when the agent
+   * only answered a question or pushed back. See
+   * {@link ReviewComment.revised}.
+   */
+  revised?: boolean;
 }
 
 /** One per changed file: <sha1(path)>.json inside the session folder. */
@@ -43,6 +73,14 @@ export interface FileReview {
    * The agent must clear it on re-submission (its new round needs a fresh review).
    */
   ready?: boolean;
+  /**
+   * Set `true` by the agent on every (re-)submission of a file it just worked
+   * on — i.e. it changed this file since the human last reviewed it. The GUI
+   * uses it to flag the file in the left panel (colored name + a "changed by
+   * the agent" icon). The human clears it implicitly by accepting the file
+   * (the GUI sets it back to `false`). Absent/false = nothing new to point at.
+   */
+  agentTouched?: boolean;
   updatedAt: string;
 }
 
@@ -99,6 +137,34 @@ export function unansweredDiscussion(fr: FileReview): DiscussionEntry[] {
 
 export function hasOpenFeedback(fr: FileReview): boolean {
   return unresolvedComments(fr).length > 0 || unansweredDiscussion(fr).length > 0;
+}
+
+/**
+ * Whether the agent has made changes to this file that are still awaiting a
+ * fresh look (the agent set `agentTouched` on a re-submission and the human
+ * has not accepted since). Drives the "agent changed this" color/icon in the
+ * left panel.
+ */
+export function fileHasAgentChanges(fr: FileReview): boolean {
+  return fr.agentTouched === true && fr.status !== 'accepted';
+}
+
+/**
+ * Feedback items the agent has already revised — i.e. it changed the code in
+ * response (it set `revised: true` alongside its reply). Drives the "revised"
+ * pill in the code view and the "revised" icon in the left panel.
+ */
+export function revisedFeedback(
+  fr: FileReview
+): (ReviewComment | DiscussionEntry)[] {
+  return [
+    ...fr.comments.filter((c) => c.revised === true),
+    ...fr.discussion.filter((d) => d.revised === true),
+  ];
+}
+
+export function hasRevisedFeedback(fr: FileReview): boolean {
+  return revisedFeedback(fr).length > 0;
 }
 
 /**

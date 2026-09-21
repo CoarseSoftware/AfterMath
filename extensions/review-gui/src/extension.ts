@@ -1,7 +1,9 @@
+import { execFileSync } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { FileReview, Session, hasOpenFeedback, isReleasable, isSessionFinalized, listSessions } from '@aftermath/protocol';
-import { openReviewPanel, setSessionsChangedListener } from './reviewPanel';
+import { FileReview, Session, fileHasAgentChanges, hasOpenFeedback, hasRevisedFeedback, isReleasable, isSessionFinalized, listSessions, writeFileReview } from '@aftermath/protocol';
+import { notifyPanels, openReviewPanel, setSessionsChangedListener } from './reviewPanel';
 
 const SCAN_INTERVAL_MS = 10_000;
 
@@ -28,24 +30,65 @@ class FileItem extends vscode.TreeItem {
     // Show only the file name — the folder chain is already the tree path,
     // so the full path here would push the row far to the right.
     const fileName = fr.path.split('/').pop() ?? fr.path;
-    super(fileName, vscode.TreeItemCollapsibleState.None);
-    this.description =
-      fr.status.replace('_', ' ') +
-      (this.fr.ready ? ' · released' : hasOpenFeedback(this.fr) ? ' · open feedback' : '');
+    const changed = fileHasAgentChanges(fr);
     const openComments = fr.comments.filter((c) => !c.resolved).length;
     const openDiscussion = fr.discussion.filter((d) => !d.answered).length;
+    const revised = hasRevisedFeedback(fr);
+
+    // Single-row tree item: file name (label) + a status "pill" and any detail
+    // in the description. This API's TreeItem label has no markdown/multi-line
+    // support, so everything lives on one line and long names simply truncate.
+    const detailParts: string[] = [];
+    if (changed) detailParts.push('AI updated this file');
+    if (fr.ready) detailParts.push('released');
+    if (hasOpenFeedback(fr) && detailParts.length === 0) detailParts.push('open feedback');
+    if (openComments > 0) detailParts.push(`${openComments} open comment${openComments === 1 ? '' : 's'}`);
+    if (openDiscussion > 0) detailParts.push(`${openDiscussion} unanswered`);
+
+    // The colored ThemeIcon (sparkle/rocket/check/…) carries the state; the
+    // label stays plain so the row reads as:  [icon] name  status  details.
+    super(fileName, vscode.TreeItemCollapsibleState.None);
+    // Plain-text description keeps a tooltip / accessibility fallback.
+    this.description = [statusPill(fr.status), ...detailParts].join('  ');
+
     this.tooltip =
       fr.path +
       '\n' +
       fr.status +
+      (changed ? ' — AI updated this file' : '') +
       (openComments ? ` — ${openComments} open comment(s)` : '') +
       (openDiscussion ? ` — ${openDiscussion} open discussion` : '') +
       (this.fr.ready ? ' — released to the agent (waiting on the AI)' : '');
+    // deleted / added / edit — drives the red "-", yellow "+" or pencil icon.
+    const kind = fileChangeKind(fr, repoRootOf(session.dir), session.manifest.baseRef);
     this.iconPath = new vscode.ThemeIcon(
-      fileIcon(fr.status, openComments + openDiscussion > 0, fr.ready === true),
-      new vscode.ThemeColor(fileIconColor(fr.status, fr.ready === true))
+      fileIcon(fr, openComments, openDiscussion, fr.ready === true, changed, revised, session.manifest.agent, kind),
+      new vscode.ThemeColor(fileIconColor(fr.status, fr.ready === true, changed, revised, kind))
     );
     this.contextValue = 'file';
+    // Clicking a row opens its review panel (the command runs on selection;
+    // the description row is the only one the selection handler itself acts
+    // on). Right-click offers the status commands (see package.json menus).
+    this.command = {
+      command: 'afterMath.openFileReview',
+      title: 'Open Review',
+      arguments: [session.dir, session.manifest.session, fr.path],
+    };
+  }
+}
+
+/** Plain-text status label for a file row (the colored ThemeIcon carries the
+ *  color; no emoji dots between the name and the status). */
+function statusPill(status: FileReview['status']): string {
+  switch (status) {
+    case 'accepted':
+      return 'accepted';
+    case 'rejected':
+      return 'rejected';
+    case 'in_review':
+      return 'in review';
+    default:
+      return 'needs review';
   }
 }
 
@@ -108,43 +151,114 @@ class FolderItem extends vscode.TreeItem {
     /** Remaining path segments below this folder. */
     public readonly segments: string[],
     /** Session file paths that live under this folder. */
-    public readonly filePaths: string[]
+    public readonly filePaths: string[],
+    /** Names of this folder's sub-folders (direct children). */
+    subFolderNames: string[],
+    /** The row's own display name (the collapsed folder name, e.g. "UseCases/Menu"). */
+    public readonly displayName: string
   ) {
-    // Label = this folder's OWN name (the last segment), not the top-level
-    // one — every row shows a different name down the chain.
-    super(segments[segments.length - 1], vscode.TreeItemCollapsibleState.Expanded);
-    this.description = `${filePaths.length} file${filePaths.length === 1 ? '' : 's'}`;
-    this.tooltip = segments.join('/');
+    // Like the git changes view: a chain of single sub-folders is AGGREGATED
+    // onto one row instead of one row per folder — the common prefix stops
+    // being a wall of one-name rows, and only the first point of divergence
+    // (two sub-folders, or a folder next to files) expands. The label is ONLY
+    // this row's own name (which may be a short collapsed chain like
+    // "UseCases/Menu"), not the whole path from the root — the parent rows
+    // already show that, and repeating it pushes the row far to the right.
+    // (The raw parameter, not this.displayName: parameter properties are
+    // assigned only AFTER super() returns.)
+    super(displayName, vscode.TreeItemCollapsibleState.Expanded);
+    const inline = subFolderNames.slice(0, 2);
+    // Show how many files in this folder are accepted (right-click the row to
+    // accept / un-accept all of them).
+    let accepted = 0;
+    for (const p of filePaths) {
+      const fr = session.files.find((x) => x.path === p);
+      if (fr && fr.status === 'accepted') accepted += 1;
+    }
+    const parts: string[] = [
+      `${accepted}/${filePaths.length} accepted`,
+    ];
+    if (inline.length === 1) parts.push(inline[0]);
+    else if (inline.length === 2) parts.push(`${inline[0]}, ${inline[1]}`);
+    this.description = parts.join(' · ');
+    this.tooltip =
+      segments.join('/') +
+      `\n${accepted} of ${filePaths.length} file(s) accepted` +
+      (subFolderNames.length > 0 ? `\n${subFolderNames.join(', ')}` : '');
     this.iconPath = new vscode.ThemeIcon('folder');
     this.contextValue = 'folder';
+    // Clicking a folder row opens the first file in it (the tree view's
+    // selection handler is what triggers the command).
+    if (filePaths.length > 0) {
+      this.command = {
+        command: 'afterMath.openFileReview',
+        title: 'Open Review',
+        arguments: [session.dir, session.manifest.session, filePaths[0]],
+      };
+    }
   }
 }
 
+/** Direct sub-folder names of a level (paths whose next segment is a folder). */
+function subFolderNames(segments: string[], filePaths: string[]): string[] {
+  const names = new Set<string>();
+  for (const p of filePaths) {
+    const rest = p.split('/').slice(segments.length);
+    if (rest.length > 1) names.add(rest[0]);
+  }
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+
 /**
- * Children of a folder level: group the file paths by their next segment.
- * Folders come first (alphabetical), then root-level files.
+ * Collapse a chain of single sub-folders into one name, like the git changes
+ * view: if `seg` is the ONLY sub-folder at its level and there are no files
+ * beside it, the chain keeps going (a/b/c with nothing else anywhere becomes
+ * one "a/b/c" row instead of three one-name rows). The chain stops at the
+ * first level that has a second sub-folder or a file — that is where the
+ * tree fans out again. `filePaths` may be the WHOLE session; it is narrowed
+ * to the files actually under each level before counting (siblings outside
+ * this branch must not stop the chain).
+ */
+function collapseChain(segments: string[], name: string, filePaths: string[]): string {
+  let cur = name;
+  for (;;) {
+    const segs = segments.concat(cur.split('/'));
+    const under = filePaths.filter((p) => p.split('/').slice(0, segs.length).join('/') === segs.join('/'));
+    if (under.some((p) => p.split('/').slice(segs.length).length === 1)) break;
+    const subs = subFolderNames(segs, under);
+    if (subs.length !== 1) break;
+    cur += '/' + subs[0];
+  }
+  return cur;
+}
+
+/**
+ * Children of a folder level: group the file paths by their next segment,
+ * collapsing single-folder chains into one row first. Folders come first
+ * (alphabetical), then root-level files.
  */
 function childrenFor(session: Session, segments: string[], filePaths: string[]): vscode.TreeItem[] {
-  const folders = new Map<string, { segs: string[]; files: string[] }>();
+  const folders = new Map<string, string[]>(); // collapsed folder name -> file paths
   const loose: string[] = [];
   for (const p of filePaths) {
-    const parts = p.split('/');
-    const rest = parts.slice(segments.length);
+    const rest = p.split('/').slice(segments.length);
     if (rest.length === 1) {
       // Only the file name is left: this is a file at this level.
       loose.push(p);
-    } else {
-      // rest[0] is a sub-folder. `segs` is the folder's full path from the
-      // session root (no file name), so the next level starts inside it.
-      const name = rest[0];
-      if (!folders.has(name)) folders.set(name, { segs: segments.concat([name]), files: [] });
-      folders.get(name)!.files.push(p);
+      continue;
     }
+    // rest[0] is a sub-folder (the collapsed name may cover several).
+    // `segs` is the folder's full path from the session root (no file
+    // name), so the next level starts inside it.
+    const name = collapseChain(segments, rest[0], filePaths);
+    if (!folders.has(name)) folders.set(name, []);
+    folders.get(name)!.push(p);
   }
   const out: vscode.TreeItem[] = [];
   [...folders.keys()].sort((a, b) => a.localeCompare(b)).forEach((name) => {
-    const f = folders.get(name)!;
-    out.push(new FolderItem(session, f.segs, f.files));
+    const files = folders.get(name)!;
+    const segs = segments.concat(name.split('/'));
+    out.push(new FolderItem(session, segs, files, subFolderNames(segs, files), name));
   });
   loose.sort((a, b) => a.localeCompare(b)).forEach((p) => {
     out.push(new FileItem(session, session.files.find((x) => x.path === p)!));
@@ -159,20 +273,106 @@ function sessionIcon(s: Session): string {
   return 'comment-discussion';
 }
 
-function fileIcon(status: FileReview['status'], hasOpen: boolean, ready: boolean): string {
-  if (ready) return 'robot';
-  if (status === 'accepted') return 'check';
-  if (hasOpen && status === 'rejected') return 'sync';
-  if (hasOpen) return 'comment';
+/**
+ * The file's kind of change vs the base commit:
+ * - `deleted` — the file exists at the base ref but is gone from the working
+ *   tree (the GUI renders it with a red "-");
+ * - `added` — the file did not exist at the base ref (yellow "+", needs review);
+ * - `edit` — both sides exist (yellow pencil).
+ */
+type FileChangeKind = 'deleted' | 'added' | 'edit';
+
+function fileChangeKind(fr: FileReview, repoRoot: string, baseRef: string): FileChangeKind {
+  const repoPath = path.join(repoRoot, fr.path);
+  const current = fs.existsSync(repoPath);
+  if (!current) return 'deleted';
+  let base: string | null = null;
+  try {
+    base = execFileSync('git', ['show', `${baseRef}:${fr.path}`], {
+      cwd: repoRoot,
+      maxBuffer: 256 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString('utf8');
+  } catch {
+    base = null; // exit != 0 (or git missing) => file not present at baseRef
+  }
+  if (base === null || base === '') return 'added';
   return 'edit';
 }
 
-/** Icon color: green check when accepted, blue robot when released to the
- *  agent, a stand-out yellow pencil while awaiting review. */
-function fileIconColor(status: FileReview['status'], ready: boolean): string {
+function fileIcon(
+  fr: FileReview,
+  openComments: number,
+  openDiscussion: number,
+  ready: boolean,
+  changed: boolean,
+  revised: boolean,
+  agentName: string,
+  kind: FileChangeKind
+): string {
+  if (fr.status === 'accepted') return 'check';
+  if (changed) {
+    // The agent changed this file since you last looked: a rocket when it has
+    // actually revised feedback for you, a sparkle otherwise.
+    return revised ? 'rocket' : 'sparkle';
+  }
+  if (ready) return 'robot';
+  if (openComments + openDiscussion > 0) {
+    // Open feedback: a CHAT icon so it stands out — and when it came from the
+    // CODE REVIEWER (the session's agent) it gets the same blue as the
+    // "Revise" buttons so review comments are unmistakable at a glance.
+    const fromReviewer = fr.discussion
+      .filter((d) => !d.answered)
+      .some((d) => reviewerAuthor(d.author, agentName)) ||
+      fr.comments
+        .filter((c) => !c.resolved)
+        .some((c) => reviewerAuthor(c.author, agentName));
+    return fromReviewer ? 'comment-discussion' : 'comment';
+  }
+  // No open feedback: the kind of change the file carries. Deleted files get
+  // a red "-", added files a yellow "+", edits keep the yellow pencil.
+  if (kind === 'deleted') return 'dash';
+  if (kind === 'added') return 'add';
+  if (fr.status === 'rejected') return 'sync';
+  return 'edit';
+}
+
+/** Is this discussion/comment author the session's code reviewer (the AI
+ *  agent that submitted the review)? Compared case-insensitively on the
+ *  account part (a "claude@devbox" style author matches "claude"). */
+function reviewerAuthor(author: string, agentName: string): boolean {
+  if (!agentName) return false;
+  const a = author.trim().toLowerCase();
+  const r = agentName.trim().toLowerCase();
+  if (a === r) return true;
+  const aLocal = a.split('@')[0];
+  const rLocal = r.split('@')[0];
+  return aLocal.length > 0 && aLocal === rLocal;
+}
+
+/** Icon color: green check when accepted, blue rocket when the agent revised
+ *  your feedback, purple sparkle when the agent changed the file, blue robot
+ *  when released to the agent, a stand-out blue chat icon for reviewer
+ *  comments, a red "-" for deleted files, and stand-out yellow ("+" for new
+ *  files, pencil for edits) while awaiting review. */
+function fileIconColor(
+  status: FileReview['status'],
+  ready: boolean,
+  changed: boolean,
+  revised: boolean,
+  kind: FileChangeKind
+): string {
   if (status === 'accepted') return 'charts.green';
+  if (changed && revised) return 'charts.blue';
+  if (changed) return 'charts.purple';
   if (ready) return 'charts.blue';
+  if (kind === 'deleted') return 'charts.red';
   return 'charts.yellow';
+}
+
+/** The repo root for a session dir (<root>/.aftermath/reviews/<id>). */
+function repoRootOf(sessionDir: string): string {
+  return path.resolve(sessionDir, '..', '..', '..');
 }
 
 class SessionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
@@ -209,14 +409,62 @@ class SessionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   }
 
   async handleItemClick(item: vscode.TreeItem | undefined): Promise<void> {
+    // File/folder rows carry their own command (open the review panel); the
+    // selection handler only deals with the description row.
     if (item instanceof DescriptionItem) {
       await showDescriptionMarkdown(item.session);
-      return;
-    }
-    if (item instanceof FileItem) {
-      await openReviewPanel(item.session.dir, item.session.manifest, item.fr.path);
     }
   }
+
+  /** Right-click: set ONE file's status. The status is written straight to
+   *  disk (no git work), then the panel (if open) and the tree refresh. */
+  setFileStatus(item: vscode.TreeItem | undefined, status: FileReview['status']): void {
+    if (!(item instanceof FileItem)) return;
+    const { session, fr } = item;
+    fr.status = status;
+    // Accepting acknowledges the agent's changes (same as the Accept button).
+    if (status === 'accepted') fr.agentTouched = false;
+    fr.updatedAt = new Date().toISOString();
+    try {
+      writeFileReview(session.dir, fr);
+    } catch (err) {
+      void vscode.window.showErrorMessage(`After Math: ${String(err)}`);
+      return;
+    }
+    // Instant UI feedback: the tree row re-renders (via the refresh
+    // listener) and any open panel for this session flips its status pill /
+    // accept button / file counts without a git diff round-trip.
+    notifyPanels(session.dir);
+    notifyTreeAndPanels?.();
+  }
+
+  /** Right-click: set EVERY file under a folder to a status (accept all /
+   *  un-accept all). Each file is written to disk, then one refresh. */
+  setFolderStatus(item: vscode.TreeItem | undefined, status: FileReview['status']): void {
+    if (!(item instanceof FolderItem)) return;
+    const { session, filePaths } = item;
+    const now = new Date().toISOString();
+    for (const p of filePaths) {
+      const fr = session.files.find((x) => x.path === p);
+      if (!fr) continue;
+      fr.status = status;
+      if (status === 'accepted') fr.agentTouched = false;
+      fr.updatedAt = now;
+      try {
+        writeFileReview(session.dir, fr);
+      } catch (err) {
+        void vscode.window.showErrorMessage(`After Math: ${String(err)}`);
+        return;
+      }
+    }
+    notifyPanels(session.dir);
+    notifyTreeAndPanels?.();
+  }
+}
+
+let notifyTreeAndPanels: (() => void) | undefined;
+export function setTreeRefreshListener(cb: () => void): void {
+  notifyTreeAndPanels = cb;
 }
 
 function watchedRoots(): string[] {
@@ -252,6 +500,13 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   setSessionsChangedListener(() => void scan(false));
+
+  // Right-click status changes write straight to disk (no git work): refresh
+  // the tree in place. Open panels were already updated by notifyPanels
+  // (quick message — no diff recompute, no full re-scan).
+  setTreeRefreshListener(() => {
+    provider.refresh();
+  });
 
   const seen = new Map<string, number>(); // session dir -> last seen submission
 
@@ -316,6 +571,11 @@ export function activate(context: vscode.ExtensionContext): void {
     statusItem.show();
   }
 
+  const openFileReview = (sessionDir: string, _sessionId: string, filePath: string): void => {
+    const s = provider.sessions.find((x) => x.dir === sessionDir);
+    if (s) void openReviewPanel(s.dir, s.manifest, filePath);
+  };
+
   context.subscriptions.push(
     vscode.commands.registerCommand('afterMath.refresh', () => void scan(true)),
     vscode.commands.registerCommand('afterMath.openSession', () => {
@@ -325,9 +585,55 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const s = provider.sessions[0];
       if (s.files[0]) void openReviewPanel(s.dir, s.manifest, s.files[0].path);
+    }),
+    // Row click (the tree items carry this command): open the review panel.
+    vscode.commands.registerCommand('afterMath.openFileReview', (sessionDir: string, sessionId: string, filePath: string) => {
+      openFileReview(sessionDir, sessionId, filePath);
+    }),
+    // Right-click a file row: set its status.
+    vscode.commands.registerCommand('afterMath.file.setStatus', (item: vscode.TreeItem, status: string) => {
+      if (status === 'needs_review' || status === 'in_review' || status === 'accepted' || status === 'rejected') {
+        provider.setFileStatus(item, status);
+      }
+    }),
+    // Right-click a folder row: accept all / un-accept all files in it.
+    vscode.commands.registerCommand('afterMath.folder.setStatus', (item: vscode.TreeItem, status: string) => {
+      if (status === 'accepted' || status === 'needs_review') {
+        provider.setFolderStatus(item, status);
+      }
     })
   );
   view.onDidChangeSelection((e) => void provider.handleItemClick(e.selection[0]));
+
+  // Live updates for the left panel: the agent re-writes the session's JSON
+  // files on disk (re-submissions, replies, "revised" flags). Watch every
+  // watched root for `.aftermath/reviews/**` and re-scan (debounced) so the
+  // tree — not just the open review panel — refreshes without a reload. The
+  // 10 s timer above stays as a safety net for anything the watcher misses.
+  let scanDebounce: NodeJS.Timeout | undefined;
+  const scheduleScan = (): void => {
+    if (scanDebounce) clearTimeout(scanDebounce);
+    scanDebounce = setTimeout(() => {
+      scanDebounce = undefined;
+      void scan(false);
+    }, 400);
+  };
+  // Glob separators are always forward slashes, even on Windows — a
+  // path.join pattern would emit backslashes that never match.
+  for (const root of watchedRoots()) {
+    const w = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(root, '.aftermath/reviews/**')
+    );
+    w.onDidCreate(scheduleScan);
+    w.onDidChange(scheduleScan);
+    w.onDidDelete(scheduleScan);
+    context.subscriptions.push(w);
+  }
+  context.subscriptions.push({
+    dispose: () => {
+      if (scanDebounce) clearTimeout(scanDebounce);
+    },
+  });
 
   void scan(true);
   const timer = setInterval(() => void scan(true), SCAN_INTERVAL_MS);
