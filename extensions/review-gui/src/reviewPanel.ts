@@ -18,7 +18,7 @@ import {
 } from '@aftermath/protocol';
 import * as fs from 'fs';
 import { getBaseLines, getCurrentLines } from './git';
-import { isSupported, lookup } from './languages';
+import { dbgLog, isSupported, lookup } from './languages';
 
 export type LayoutMode = 'unified' | 'side' | 'hybrid';
 
@@ -380,6 +380,7 @@ async function createPanelContent(
 ): Promise<void> {
   const key = sessionDir + '::' + filePath;
   const repoRoot = repoRootOf(sessionDir);
+  dbgLog(`panel: created for ${filePath} (root ${repoRoot})`);
   const context = vscode.workspace
     .getConfiguration('afterMath')
     .get<number>('diffContext', 3);
@@ -604,8 +605,10 @@ async function createPanelContent(
       // language service for THIS file and send the answer back to the
       // webview. Only TS/JS files produce a result.
       if (msg.line === undefined) return;
+      dbgLog(`panel: codeHover line=${msg.line} col=${msg.col} file=${filePath} supported=${isSupported(filePath)}`);
       if (isSupported(filePath)) {
         const result = await lookup(repoRoot, filePath, msg.line, msg.col ?? 0);
+        dbgLog(`panel: codeHover answer hover=${result?.hover ? 'yes' : 'no'} def=${result?.definition ? 'yes' : 'no'} disposed=${disposed}`);
         if (!disposed) {
           void panel.webview.postMessage({ type: 'hoverResult', line: msg.line, result });
         }
@@ -641,11 +644,18 @@ async function createPanelContent(
       if (msg.action === 'goDef') {
         // Only TS/JS files can carry a definition; anything else (or a
         // position with no symbol) has nowhere to jump to.
+        dbgLog(`panel: codeContext goDef line=${msg.line} col=${msg.col} file=${filePath} supported=${isSupported(filePath)}`);
         if (!isSupported(filePath)) return;
         const result = await lookup(repoRoot, filePath, msg.line, msg.col ?? 0);
-        if (result?.definition) open(result.definition.file, result.definition);
+        if (result?.definition) {
+          dbgLog(`panel: codeContext goDef -> opening ${result.definition.file}:${result.definition.line}:${result.definition.character}`);
+          open(result.definition.file, result.definition);
+        } else {
+          dbgLog('panel: codeContext goDef -> no definition found, opening nothing');
+        }
         return;
       }
+      dbgLog(`panel: codeContext openFile file=${filePath}`);
       open(filePath); // action 'openFile' (and the legacy default)
       return;
     }

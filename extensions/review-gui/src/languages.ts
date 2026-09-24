@@ -1,6 +1,22 @@
+import * as child_process from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as ts from 'typescript';
+
+/** TEMPORARY host-side diagnostics (hover/definition round-trip). Every
+ *  step logs to %TEMP%/aftermath-debug.log so a runtime failure inside the
+ *  extension host is visible without the dev console. Remove once the
+ *  hover/definition issue is confirmed fixed. */
+function dbg(msg: string): void {
+  try {
+    fs.appendFileSync(path.join(os.tmpdir(), 'aftermath-debug.log'), new Date().toISOString() + ' ' + msg + '\n');
+  } catch {
+    /* logging must never break the feature */
+  }
+}
+export { dbg as dbgLog };
+dbg('languages module loaded (typescript ' + (ts.version || '?') + ')');
 
 // ---------------------------------------------------------------------------
 // Hover type info + go-to-definition for the review webview.
@@ -63,8 +79,191 @@ export function isSupported(filePath: string): boolean {
   const e = path.extname(filePath).toLowerCase();
   return (
     e === '.ts' || e === '.tsx' || e === '.js' || e === '.jsx' ||
-    e === '.mts' || e === '.cts' || e === '.mjs' || e === '.cjs'
+    e === '.mts' || e === '.cts' || e === '.mjs' || e === '.cjs' ||
+    e === '.cs'
   );
+}
+
+// ---------------------------------------------------------------------------
+// C# support: a small shipped helper (`cshover`, in the extension's
+// `cshover/` folder) hosts Roslyn's MSBuildWorkspace — the same route the
+// C# tooling uses — and answers hover/definition over JSON on stdin/stdout.
+// One long-lived process; it caches a workspace per project internally.
+// Requires the `dotnet` CLI on PATH (framework-dependent publish).
+// ---------------------------------------------------------------------------
+
+interface CSharpProc {
+  proc: child_process.ChildProcess;
+  ready: Promise<void>;
+  busy: boolean;
+  dead: boolean;
+  queue: { id: number; resolve: (v: LookupResult | null) => void }[];
+  outBuf: string;
+}
+
+let csharp: CSharpProc | undefined;
+let csharpSeq = 0;
+/** Repo root for each in-flight cshover request (to make definition
+ *  paths repo-relative). */
+const csharpRoots = new Map<number, string>();
+
+/** Location of the shipped helper (the extension root is `..` of `out/`). */
+function helperDll(): string {
+  return path.join(__dirname, '..', 'cshover', 'cshover.dll');
+}
+
+function spawnCSharp(): CSharpProc {
+  const entry = helperDll();
+  const proc = child_process.spawn('dotnet', [entry], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const state: CSharpProc = {
+    proc,
+    ready: new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => {
+        if (!state.dead) {
+          state.dead = true;
+          proc.kill();
+        }
+        reject(new Error('cshover start timeout'));
+      }, 90_000);
+      // The helper is ready as soon as it has a stdin stream; the first
+      // request's cold start (loading the project) happens in-process.
+      setImmediate(() => {
+        clearTimeout(t);
+        resolve();
+      });
+    }),
+    busy: false,
+    dead: false,
+    queue: [],
+    outBuf: '',
+  };
+  proc.stdout!.on('data', (d: Buffer) => {
+    state.outBuf += d.toString('utf8');
+    let idx = state.outBuf.indexOf('\n');
+    while (idx >= 0) {
+      const line = state.outBuf.slice(0, idx).trim();
+      state.outBuf = state.outBuf.slice(idx + 1);
+      idx = state.outBuf.indexOf('\n');
+      if (line.length === 0) continue;
+      const next = state.queue.shift();
+      if (!next) continue; // unsolicited line — ignore
+      const root = csharpRoots.get(next.id) ?? process.cwd();
+      csharpRoots.delete(next.id);
+      try {
+        next.resolve(parseCSharpReply(line, root));
+      } catch {
+        next.resolve(null);
+      }
+    }
+  });
+  proc.stderr!.on('data', (d: Buffer) => {
+    dbg('cshover stderr: ' + d.toString('utf8').split('\n').filter(Boolean).slice(0, 3).join(' | '));
+  });
+  proc.on('error', (err) => {
+    dbg('cshover spawn error: ' + err.message + ' (is the dotnet CLI on PATH?)');
+    state.dead = true;
+    for (const q of state.queue) q.resolve(null);
+    state.queue = [];
+  });
+  proc.on('exit', () => {
+    state.dead = true;
+    for (const q of state.queue) q.resolve(null);
+    state.queue = [];
+    if (csharp === state) csharp = undefined;
+  });
+  return state;
+}
+
+/** Map one helper reply line to a LookupResult (paths made repo-relative). */
+function parseCSharpReply(line: string, repoRoot: string): LookupResult | null {
+  const obj = JSON.parse(line) as {
+    hover?: { kind: string; text?: string | null; callable?: boolean } | null;
+    definition?: { file: string; line: number; character: number } | null;
+    error?: string | null;
+  };
+  if (obj.error) dbg('cshover error: ' + obj.error);
+  let definition: DefinitionTarget | null = null;
+  if (obj.definition && obj.definition.file) {
+    // Absolute (OS-style) path → repo-relative (forward slashes). The file
+    // may live in a referenced project outside this repo — keep it only
+    // when it is inside (or we accept absolute → relative from cwd).
+    const rel = path.relative(repoRoot, obj.definition.file);
+    if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+      definition = {
+        file: rel.split(path.sep).join('/'),
+        line: obj.definition.line,
+        character: obj.definition.character,
+      };
+    }
+  }
+  if (!obj.hover && !definition) return null;
+  return {
+    hover: obj.hover
+      ? { kind: obj.hover.kind, text: obj.hover.text ?? '', callable: !!obj.hover.callable }
+      : null,
+    definition,
+  };
+}
+
+/** Ask the (lazily spawned) cshover helper for hover/definition. */
+function csharpLookup(repoRoot: string, abs: string, line: number, character: number): Promise<LookupResult | null> {
+  if (!csharp || csharp.dead) csharp = spawnCSharp();
+  const state = csharp;
+  const id = ++csharpSeq;
+  csharpRoots.set(id, repoRoot);
+  return new Promise<LookupResult | null>((resolve) => {
+    // Every resolution path must forget the root for this id.
+    const finish = (v: LookupResult | null) => {
+      csharpRoots.delete(id);
+      resolve(v);
+    };
+    state.queue.push({ id, resolve: finish });
+    state.ready
+      .catch(() => {
+        // Spawn failed (e.g. no dotnet CLI): drain this request as null.
+        const i = state.queue.findIndex((q) => q.id === id);
+        if (i >= 0) {
+          state.queue.splice(i, 1);
+          finish(null);
+        }
+      })
+      .then(() => {
+        try {
+          const req = JSON.stringify({
+            file: abs,
+            line,
+            col: character,
+          });
+          state.proc.stdin!.write(req + '\n');
+        } catch (err) {
+          dbg('cshover write failed: ' + String(err));
+          const i = state.queue.findIndex((q) => q.id === id);
+          if (i >= 0) state.queue.splice(i, 1);
+          finish(null);
+        }
+      });
+    // Cold starts load the whole project (MSBuild restore can take a
+    // while); bound the wait so the UI never hangs. The helper answers
+    // strictly in order, so a timed-out request would desync the stream —
+    // recycle the process instead.
+    setTimeout(() => {
+      const i = state.queue.findIndex((q) => q.id === id);
+      if (i >= 0) {
+        state.queue.splice(i, 1);
+        dbg('cshover: request timed out for ' + path.relative(repoRoot, abs) + ' (recycling helper)');
+        finish(null);
+        state.dead = true;
+        try {
+          state.proc.kill();
+        } catch {
+          // already gone
+        }
+      }
+    }, 120_000);
+  });
 }
 
 /** Compiler options close to `tsc`'s inferred defaults — good enough for
@@ -206,9 +405,11 @@ function serviceFor(root: string, rootFile: string): ServiceEntry | undefined {
   let files: string[];
   try {
     files = collectFiles(rootFile, opts);
-  } catch {
+  } catch (err) {
+    dbg('serviceFor: collectFiles THREW ' + (err instanceof Error ? err.stack ?? String(err) : String(err)));
     return undefined;
   }
+  dbg(`serviceFor: built around ${path.relative(root, rootFile)} (${files.length} files)`);
   const host = makeHost(root, files, opts);
   const svc = ts.createLanguageService(host, ts.createDocumentRegistry());
   const entry: ServiceEntry = { svc, rootFile, files, idle: undefined };
@@ -355,7 +556,11 @@ function quickInfoAtEnclosingName(svc: ts.LanguageService, sf: ts.SourceFile, po
  * the UI simply shows nothing.
  */
 export function lookup(repoRoot: string, filePath: string, line: number, character: number): Promise<LookupResult | null> {
-  if (!isSupported(filePath)) return Promise.resolve(null);
+  if (!isSupported(filePath)) {
+    dbg(`lookup: unsupported extension for ${filePath}`);
+    return Promise.resolve(null);
+  }
+  dbg(`lookup: ${filePath}:${line}:${character} (root ${repoRoot})`);
   // Supersede any in-flight request for this root: it resolves to null as
   // soon as it notices it is no longer the newest (its own identity check,
   // below — a stale finish() can NEVER consume the newer request's promise).
@@ -364,30 +569,55 @@ export function lookup(repoRoot: string, filePath: string, line: number, charact
   const id = ++seq;
   return new Promise<LookupResult | null>((resolve) => {
     pending.set(repoRoot, { id, resolve });
-    // The language service is synchronous; defer one tick so the webview
-    // round-trip (and any other host work) is not blocked by the first,
-    // slower import-graph build.
+    // C# goes through the cshover Roslyn helper (async); everything else
+    // uses the in-process TypeScript language service (synchronous).
+    const isCSharp = path.extname(filePath).toLowerCase() === '.cs';
     setImmediate(() => {
-      let result: LookupResult | null = null;
-      try {
-        const abs = path.join(repoRoot, filePath);
-        if (fs.existsSync(abs)) {
-          const entry = serviceFor(repoRoot, abs);
-          if (entry) result = answer(entry.svc, repoRoot, abs, line, character) ?? null;
+      void (async () => {
+        let result: LookupResult | null = null;
+        try {
+          const abs = path.join(repoRoot, filePath);
+          if (!fs.existsSync(abs)) {
+            dbg(`lookup: file missing on disk: ${abs}`);
+          } else if (isCSharp) {
+            result = await csharpLookup(repoRoot, abs, line, character);
+            dbg(
+              'csharpLookup: result ' +
+                (result
+                  ? `hover=${JSON.stringify(result.hover?.kind ?? null)} def=${JSON.stringify(result.definition)}`
+                  : 'null')
+            );
+          } else {
+            const entry = serviceFor(repoRoot, abs);
+            if (!entry) dbg('lookup: serviceFor returned undefined');
+            if (entry) {
+              result = answer(entry.svc, repoRoot, abs, line, character) ?? null;
+              dbg(
+                'lookup: result ' +
+                  (result
+                    ? `hover=${JSON.stringify(result.hover?.kind ?? null)} def=${JSON.stringify(result.definition)}`
+                    : 'null (no symbol at position or no source file)')
+              );
+            }
+          }
+        } catch (err) {
+          dbg('lookup: THREW ' + (err instanceof Error ? err.stack ?? String(err) : String(err)));
+          result = null;
+        } finally {
+          if (!isCSharp) scheduleIdle(repoRoot);
         }
-      } catch {
-        result = null;
-      } finally {
-        scheduleIdle(repoRoot);
-      }
-      // Deliver ONLY if this is still the newest request — otherwise a slow
-      // answer for line A must not land as the answer to line B (the
-      // webview would show a tooltip for the wrong symbol, and "Go to
-      // Definition" would open the wrong file).
-      if (pending.get(repoRoot)?.id === id) {
-        pending.delete(repoRoot);
-        resolve(result);
-      }
+        // Deliver ONLY if this is still the newest request — otherwise a slow
+        // answer for line A must not land as the answer to line B (the
+        // webview would show a tooltip for the wrong symbol, and "Go to
+        // Definition" would open the wrong file).
+        if (pending.get(repoRoot)?.id === id) {
+          pending.delete(repoRoot);
+          dbg('lookup: delivering result to newest request');
+          resolve(result);
+        } else {
+          dbg(`lookup: superseded (id ${id}), dropping result`);
+        }
+      })();
     });
   });
 }
@@ -404,7 +634,10 @@ function answer(svc: ts.LanguageService, repoRoot: string, abs: string, line: nu
   const pos = positionFor(sf, line, character);
   let quick = svc.getQuickInfoAtPosition(abs, pos) ?? svc.getQuickInfoAtPosition(abs, Math.max(0, pos - 1));
   if (!quick) quick = quickInfoAtEnclosingName(svc, sf, pos);
-  if (!quick) return undefined;
+  if (!quick) {
+    dbg(`answer: no quick info at offset ${pos} (line ${line}, col ${character}) in ${path.relative(repoRoot, abs)}`);
+    return undefined;
+  }
 
   // Second hover line: the symbol's own declaration.
   let declText = '';
@@ -418,6 +651,7 @@ function answer(svc: ts.LanguageService, repoRoot: string, abs: string, line: nu
 
   let definition: DefinitionTarget | null = null;
   const defs = svc.getDefinitionAtPosition(abs, pos) ?? svc.getDefinitionAtPosition(abs, Math.max(0, pos - 1));
+  dbg(`answer: ${defs?.length ?? 0} definition(s) at offset ${pos}`);
   if (defs && defs.length > 0) {
     // Prefer the .ts/.tsx SOURCE over a compiled .d.ts stub when the
     // symbol is re-exported through a declaration file (the definition

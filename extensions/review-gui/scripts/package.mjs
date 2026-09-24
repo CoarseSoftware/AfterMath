@@ -25,6 +25,9 @@ fs.rmSync(outDir, { force: true });
 const include = (rel) =>
   rel === 'package.json' ||
   rel.startsWith('out/') ||
+  // The cshover Roslyn helper (C# hover + go-to-definition). Shipped as the
+  // trimmed `dotnet publish` output; see tools/cshover.
+  rel.startsWith('cshover/') ||
   rel.startsWith('media/') ||
   rel.startsWith('node_modules/@aftermath/') ||
   // The TypeScript compiler (hover type info + go-to-definition in the

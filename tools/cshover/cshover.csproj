@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- The helper runs framework-dependent via `dotnet`; roll forward onto
+         any newer .NET runtime the box happens to have. -->
+    <RollForward>Major</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>cshover</AssemblyName>
+    <!-- Framework-dependent (the .NET runtime must be on the machine; the
+         extension also needs the `dotnet` CLI for the build server). NOT
+         single-file: the MSBuild out-of-process BuildHost that
+         MSBuildWorkspace uses does not bundle into a single file, so a
+         single-file publish silently degrades to "no project loaded". -->
+    <SelfContained>false</SelfContained>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.14.0" />
+  </ItemGroup>
+
+</Project>

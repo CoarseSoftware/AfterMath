@@ -1,6 +1,12 @@
 node_modules/
 out/
 *.tsbuildinfo
+# cshover helper binaries (rebuild with: dotnet publish -c Release -o ship,
+# then copy tools/cshover/ship -> extensions/review-gui/cshover)
+extensions/review-gui/cshover/
+tools/cshover/bin/
+tools/cshover/obj/
+tools/cshover/ship/
 daemon/.state.json
 .aftermath/
 *.vsix

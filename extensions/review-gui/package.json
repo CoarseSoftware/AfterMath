@@ -2,7 +2,7 @@
   "name": "after-math",
   "displayName": "After Math",
   "description": "Local code review GUI for AI coding sessions (After Math by Coarse Software)",
-  "version": "0.1.7",
+  "version": "0.1.9",
   "publisher": "coarse-software",
   "icon": "media/icon.png",
   "license": "MIT",
