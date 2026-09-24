@@ -26,7 +26,17 @@ const include = (rel) =>
   rel === 'package.json' ||
   rel.startsWith('out/') ||
   rel.startsWith('media/') ||
-  rel.startsWith('node_modules/@aftermath/');
+  rel.startsWith('node_modules/@aftermath/') ||
+  // The TypeScript compiler (hover type info + go-to-definition in the
+  // review panel). Only the bits the runtime actually loads — the ~9 MB
+  // lib/typescript.js, its types, the package.json and LICENSE.
+  (rel.startsWith('node_modules/typescript/') &&
+    (rel === 'node_modules/typescript/package.json' ||
+      rel === 'node_modules/typescript/LICENSE' ||
+      rel === 'node_modules/typescript/lib/typescript.js' ||
+      rel === 'node_modules/typescript/lib/typescript.d.ts' ||
+      rel === 'node_modules/typescript/lib/lib.es2020.d.ts' ||
+      rel === 'node_modules/typescript/lib/lib.dom.d.ts'));
 
 const files = []; // { rel, src } — src is the real on-disk path of the file
 const walk = (dir, rel, srcBase = root) => {
@@ -48,6 +58,8 @@ walk(root, '');
 const depCandidates = [
   path.join(root, 'node_modules', '@aftermath'),
   path.join(root, '..', '..', 'node_modules', '@aftermath'), // monorepo root
+  path.join(root, 'node_modules', 'typescript'),
+  path.join(root, '..', '..', 'node_modules', 'typescript'), // monorepo root
 ];
 for (const depRoot of depCandidates) {
   let real;
@@ -56,7 +68,7 @@ for (const depRoot of depCandidates) {
   } catch {
     continue;
   }
-  walk(real, 'node_modules/@aftermath', real);
+  walk(real, real.endsWith('typescript') ? 'node_modules/typescript' : 'node_modules/@aftermath', real);
 }
 
 // ---- vsixmanifest ----------------------------------------------------------

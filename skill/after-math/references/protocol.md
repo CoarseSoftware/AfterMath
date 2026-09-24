@@ -53,7 +53,7 @@ File name = first 12 hex chars of SHA-1 of the exact repo-relative path string (
       "text": "This timeout should come from config, not a literal.",
       "author": "jacob",
       "createdAt": "2026-09-16T12:30:00.000Z",
-      "resolved": true,
+      "resolved": false,
       "reply": "Moved it to `config.timeoutMs` and removed the literal.",
       "replyAt": "2026-09-16T12:40:00.000Z",
       "revised": true
@@ -82,7 +82,7 @@ File name = first 12 hex chars of SHA-1 of the exact repo-relative path string (
   - `accepted` is set per file by the human's **Accept** button (the "Commit changes" dialog also accepts every file). Accepting does **not** release a file to the agent — the agent only works on files that are **releasable** (`ready: true` + open feedback). Never touch an `accepted`, not-ready file; it is done until the human acts again.
 - `comments[].line` — 1-based line number **in the current (new) version** of the file.
 - `comments[].side` — `right` (current side) or `left` (a removed line; `line` then refers to the adjacent current-side line).
-- `comments[].resolved` — set `true` by the agent after addressing the comment.
+- `comments[].resolved` — **human-only**. The agent NEVER sets it (it only writes `reply`/`replyAt`/`revised` on the comments it addresses and leaves `resolved` exactly as it is). The human's "Mark Resolved" button (comment box footer) flips `resolved` on **every** comment of the line's chain at once (clicking it again re-opens the whole chain). The flag is the human's open/closed state for that line.
 - `comments[].revised` / `discussion[].revised` — **agent-written** boolean, `true` when the agent made a **code change** in response to that item (as opposed to only replying to push back or ask for clarification). The GUI shows revised items with a blue "Revised" pill in the code view, and files with revised feedback get a distinct "revised" icon in the left panel. Set it alongside `reply` on every item the agent acted on; never on items it only replied to.
 - `comments[].reply` / `comments[].replyAt` — **agent-written** brief reply (1–3 sentences on what it changed) and its timestamp, set when the agent addresses the comment. Absent until then.
 - `discussion[].reply` / `discussion[].replyAt` — **agent-written** brief reply (1–3 sentences) to the discussion entry and its timestamp. Set alongside flipping `answered: true` for a question/change-request the agent answers; set (leaving `answered: false`) when the agent pushes back or needs clarification instead of changing code. Absent until then.
@@ -103,9 +103,10 @@ human reviews ──> adds line comments / discussion (per file)
                         is set rejected + ready: true
 open feedback + ready ──> waiter exits EVENT=fix
   (payload = releasable files only; unready files keep waiting)
-agent fixes ──> needs_review again, ready cleared, submission+1, comments
-                resolved (each with a brief `reply`; items with a code change
-                also get `revised: true`), `agentTouched: true`
+agent fixes ──> needs_review again, ready cleared, submission+1, each
+                addressed comment gets a brief `reply` (items with a code
+                change also get `revised: true`); `resolved` is NOT touched
+                (human-only), `agentTouched: true`
 agent blocks  ──> new waiter (repeat until accepted)
 "Commit changes" ──> available at ANY time; the dialog shows
                      "n of m files accepted" and, when not all are accepted,
@@ -129,6 +130,7 @@ Every action is scoped to ONE session: the per-file buttons (Accept, Revise, com
 - **Revise all** (session) — releases **every** file of THIS session that has open feedback at once (sets each `rejected` + `ready: true`). Files without open feedback are untouched. Other review sessions are never affected.
 - **Commit changes** (session) — marks every file of THIS session `accepted` (including files the human had not accepted yet — the dialog shows "n of m files accepted" and asks for confirmation when some are missing) and records the commit options in the manifest; that confirmation ends the session (the agent's waiter wakes with `EVENT=done`). A fully accepted session without this confirmation is still waiting. Available at any time. The dialog offers: **Commit to local branch** or **Create pull request** (radio), an optional **new branch name** (used for either), and a **Squash commit** checkbox (indented under the PR option, enabled only for PRs, checked by default) that makes the PR a single commit.
 - **Set status** (left panel, right-click a file) — sets that file's status to needs review / in review / accepted / rejected. **Accept all / Un-accept all** (right-click a folder) does the same for every file under the folder.
+- **Line comment box** (per file, anchored under a code line) — the comment chain for that line (every comment whose `line` matches). A minimize icon (▾) at the TOP RIGHT collapses the box; the gutter badge on the line reopens it. Each comment shows a pencil (edits it; reopens it when resolved). Footer: **Mark Resolved** at the BOTTOM LEFT resolves the WHOLE chain — it sets `resolved: true` on every comment on that line at once (never per comment); once the chain is fully resolved the button turns into a green "✓ Resolved" and clicking it re-opens the chain (`resolved: false` on all of them). **Submit Comment** at the BOTTOM RIGHT adds a new comment to the line.
 - **Discussion box** (per file, bottom of the code view) — free-thread Q&A / change requests with the agent. Each entry is separated by a line and tagged with a pill: a purple **robot + the agent's name** for the agent's entries, a blue **You** for the human's. The ✓ button at the end of an entry marks it `answered: true` (the entry then shows a green "✓ answered" pill, dimmed; clicking the pill re-opens it). The agent's `reply` renders as a purple reply block under the entry.
 - **File icons** (left panel, when a file has no open feedback) — red **`-`** = the change deletes the file, yellow **`+`** = the change adds a new file (needs review), yellow **pencil** = the file was edited. With open feedback the icon is a chat bubble: **blue** when the open feedback came from the agent (the session's reviewer), yellow when it came from the human.
 

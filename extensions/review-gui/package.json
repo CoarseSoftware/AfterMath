@@ -2,7 +2,7 @@
   "name": "after-math",
   "displayName": "After Math",
   "description": "Local code review GUI for AI coding sessions (After Math by Coarse Software)",
-  "version": "0.1.4",
+  "version": "0.1.7",
   "publisher": "coarse-software",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -47,6 +47,15 @@
         "command": "afterMath.folder.setStatus",
         "title": "Set Folder Status",
         "icon": "$(checklist)"
+      },
+      {
+        "command": "afterMath.openFileReviewNewTab",
+        "title": "Open Review in New Tab",
+        "icon": "$(repos)"
+      },
+      {
+        "command": "afterMath.flagShift",
+        "title": "After Math: Open Next Review in New Tab (hold while clicking)"
       }
     ],
     "menus": {
@@ -58,6 +67,13 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "afterMath.openFileReviewNewTab",
+          "when": "view == afterMath.sessions && viewItem == file",
+          "group": "open@1",
+          "title": "Open in New Tab",
+          "icon": "$(repos)"
+        },
         {
           "command": "afterMath.file.setStatus",
           "when": "view == afterMath.sessions && viewItem == file",
@@ -108,6 +124,14 @@
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "afterMath.flagShift",
+        "key": "shift",
+        "when": "view == afterMath.sessions",
+        "args": {}
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {
@@ -164,7 +188,8 @@
     "package:vsix": "node scripts/package.mjs"
   },
   "dependencies": {
-    "@aftermath/protocol": "*"
+    "@aftermath/protocol": "*",
+    "typescript": "^5.6.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

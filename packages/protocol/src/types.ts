@@ -81,6 +81,16 @@ export interface FileReview {
    * (the GUI sets it back to `false`). Absent/false = nothing new to point at.
    */
   agentTouched?: boolean;
+  /**
+   * ISO 8601 stamp written by the GUI when the human's review view for this
+   * file is closed (panel closed, or a different file took over the review
+   * tab). Feedback the HUMAN created AFTER this stamp (comments / discussion
+   * with a `createdAt` later than it) counts as "the human left a discussion"
+   * and gets the matching icon in the left panel — the agent's own initial
+   * review feedback predates the stamp and never counts. Absent = the human
+   * has not (re)looked at this file since the last submission.
+   */
+  reviewedAt?: string;
   updatedAt: string;
 }
 
@@ -165,6 +175,22 @@ export function revisedFeedback(
 
 export function hasRevisedFeedback(fr: FileReview): boolean {
   return revisedFeedback(fr).length > 0;
+}
+
+/**
+ * Did the human leave feedback (a comment or discussion entry) AFTER the
+ * view-close stamp? That is the "I looked at this file and added a
+ * discussion" state for the left panel icon. Without a stamp the answer is
+ * no (the human has not looked at the file since the last submission — the
+ * agent's initial review feedback is not a human discussion).
+ */
+export function hasHumanDiscussionSince(fr: FileReview, sinceIso?: string): boolean {
+  if (!sinceIso) return false;
+  const after = (t: string) => t > sinceIso; // ISO 8601 strings compare chronologically
+  return (
+    fr.comments.some((c) => after(c.createdAt)) ||
+    fr.discussion.some((d) => after(d.createdAt))
+  );
 }
 
 /**

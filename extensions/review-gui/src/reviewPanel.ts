@@ -16,7 +16,9 @@ import {
   sessionHasOpenFeedback,
   writeFileReview,
 } from '@aftermath/protocol';
+import * as fs from 'fs';
 import { getBaseLines, getCurrentLines } from './git';
+import { isSupported, lookup } from './languages';
 
 export type LayoutMode = 'unified' | 'side' | 'hybrid';
 
@@ -43,7 +45,64 @@ export interface ReviewData {
 }
 
 const panels = new Map<string, vscode.WebviewPanel>();
+/** Reverse of {@link panels}: panel -> its sessionDir::filePath key (needed
+ *  when a reused tab is handed over to a different file). */
+const panelKeys = new Map<vscode.WebviewPanel, string>();
+function tabKeyOf(panel: vscode.WebviewPanel): string {
+  return panelKeys.get(panel) ?? '';
+}
+/** Live generation (send/watchers) of a panel — disposed on handover to a
+ *  new file and on close. */
+const generations = new Map<vscode.WebviewPanel, { dispose: () => void }>();
+/**
+ * The un-posted discussion draft per panel (mirrored from the webview on
+ * every change). The extension API cannot cancel a webview panel's dispose,
+ * so on tab close the host uses this to warn the user and offer to restore
+ * the text (see the onDidDispose guard in openReviewPanel).
+ */
+const panelDrafts = new Map<vscode.WebviewPanel, string>();
+/** One-shot draft restore: panel -> text placed into the discussion box when
+ *  the webview's script announces readiness (a fresh panel's script may not
+ *  be live when the restore is requested). */
+const pendingRestores = new Map<vscode.WebviewPanel, string>();
 let onSessionsChanged: (() => void) | undefined;
+
+/**
+ * The ONE reused review tab. Clicking a file in the left panel swaps this
+ * tab's file instead of opening a new editor tab; holding shift (flagged via
+ * the `afterMath.flagShift` keybinding) opens a fresh tab instead.
+ */
+let reviewTabPanel: vscode.WebviewPanel | undefined;
+
+/**
+ * One-shot round-trip into a webview: post `msg`, resolve with the `value`
+ * of the next `{ type: 'reply', id }` message (undefined if the panel goes
+ * away first or nothing comes back within `timeoutMs`).
+ */
+function askWebview<T = unknown>(
+  panel: vscode.WebviewPanel,
+  msg: Record<string, unknown>,
+  timeoutMs = 300
+): Promise<T | undefined> {
+  const id = 'q' + Math.random().toString(36).slice(2);
+  return new Promise<T | undefined>((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    let sub: vscode.Disposable | undefined;
+    const finish = (v: T | undefined): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (sub) sub.dispose();
+      resolve(v);
+    };
+    timer = setTimeout(() => finish(undefined), timeoutMs);
+    sub = panel.webview.onDidReceiveMessage((m: { type?: string; id?: string; value?: T }) => {
+      if (m && m.type === 'reply' && m.id === id) finish(m.value);
+    });
+    void panel.webview.postMessage({ ...msg, id });
+  });
+}
 
 export function setSessionsChangedListener(cb: () => void): void {
   onSessionsChanged = cb;
@@ -74,6 +133,24 @@ function repoRootOf(sessionDir: string): string {
   return path.resolve(sessionDir, '..', '..', '..');
 }
 
+// ---------------------------------------------------------------------------
+// Speed: cache the git base content (git show baseRef:<file>) per
+// (repoRoot, baseRef, filePath). The base commit NEVER changes — the diff
+// re-reads it on every data send AND every file-watcher refresh, which meant
+// a `git show` subprocess (up to 64 MB buffer) on the critical path of every
+// open/switch/refresh. One subprocess per file per extension session.
+// ---------------------------------------------------------------------------
+const baseCache = new Map<string, Promise<string[] | null>>();
+function cachedBaseLines(repoRoot: string, baseRef: string, filePath: string): Promise<string[] | null> {
+  const key = repoRoot + '\0' + baseRef + '\0' + filePath;
+  let p = baseCache.get(key);
+  if (!p) {
+    p = getBaseLines(repoRoot, baseRef, filePath);
+    baseCache.set(key, p);
+  }
+  return p;
+}
+
 function statsOf(blocks: Block[]): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
@@ -94,13 +171,18 @@ async function sessionStats(
 ): Promise<{ added: number; removed: number }> {
   let added = 0;
   let removed = 0;
-  for (const p of manifest.files) {
-    const base = (await getBaseLines(repoRoot, manifest.baseRef, p)) ?? [];
-    const current = getCurrentLines(repoRoot, p);
-    const s = statsOf(computeBlocks(base, current, context));
-    added += s.added;
-    removed += s.removed;
-  }
+  // The base content is CACHED per (repoRoot, baseRef, file) — the base
+  // commit never changes, so a full session re-stat is a set of plain file
+  // reads + LCS, with git show only the FIRST time a file is seen.
+  await Promise.all(
+    manifest.files.map(async (p) => {
+      const base = (await cachedBaseLines(repoRoot, manifest.baseRef, p)) ?? [];
+      const current = getCurrentLines(repoRoot, p);
+      const s = statsOf(computeBlocks(base, current, context));
+      added += s.added;
+      removed += s.removed;
+    })
+  );
   return { added, removed };
 }
 
@@ -128,18 +210,175 @@ function genId(prefix: string, existing: { id: string }[]): string {
   return id;
 }
 
+/**
+ * Open the review for `filePath`.
+ *
+ * Tab policy: a plain click REUSES the single review tab (swapping its file,
+ * or just re-revealing it if it already shows this file). `openInNewTab`
+ * (shift-click) always opens a fresh tab. Before a different file takes over
+ * the reused tab, an un-posted discussion in it is guarded — the user is
+ * asked to discard it or cancel (see askWebview / 'hasUnposted').
+ */
 export async function openReviewPanel(
+  sessionDir: string,
+  manifest: Manifest,
+  filePath: string,
+  openInNewTab = false
+): Promise<void> {
+  const key = sessionDir + '::' + filePath;
+  const existing = panels.get(key);
+  if (existing) {
+    // This file's panel is already open (e.g. from an earlier shift-click):
+    // bring it forward.
+    existing.reveal();
+    if (!openInNewTab) reviewTabPanel = existing;
+    return;
+  }
+
+  // Plain click: reuse the single review tab instead of stacking editor tabs.
+  const tab = reviewTabPanel;
+  if (tab && !openInNewTab) {
+    if (tab.title === `Review: ${path.basename(filePath)}` && tab.viewColumn === vscode.ViewColumn.One) {
+      // The reused tab already shows this file (tracked or not) — just reveal.
+      tab.reveal();
+      return;
+    }
+    // A different file is about to take over the tab: protect an un-posted
+    // discussion (typed into the box but not sent to the session). The
+    // webview answers directly; the host-side draft mirror is the fallback
+    // when the round-trip can't complete (e.g. the tab is hidden).
+    const live = await askWebview<boolean>(tab, { type: 'hasUnposted' }, 1000);
+    const unposted = live === true || panelDrafts.has(tab);
+    if (unposted) {
+      const D = vscode.window.showErrorMessage;
+      const action = await D(
+        'You have an uncommitted discussion. Opening a new file will discard those changes. If you wanted to open in a new tab, hold shift while clicking.',
+        { modal: true },
+        'Discard discussion',
+        'Cancel'
+      );
+      if (action !== 'Discard discussion') {
+        // Cancel: keep the current file and jump to the un-posted discussion.
+        tab.reveal(vscode.ViewColumn.One, true);
+        void askWebview(tab, { type: 'gotoUnposted' });
+        return;
+      }
+      void askWebview(tab, { type: 'clearUnposted' });
+    }
+    // The tab now shows another file: hand it over to this one. The webview
+    // document is replaced (fresh script state) and createPanelContent wires
+    // up the new file's data, watchers and message handler.
+    const oldKey = tabKeyOf(tab);
+    // The user is looking at a DIFFERENT file now: stamp this file as
+    // reviewed (left-panel "discussion added" icon for the human feedback
+    // left in it). The host does the write DIRECTLY — no webview round-trip:
+    // the tab's document is replaced a moment later, which would race the
+    // reply. (The webview's 'viewClosed' reply handler exists so a future
+    // richer handshake can piggyback on this same signal.)
+    if (oldKey && oldKey !== key) {
+      const oldSessionDir = oldKey.slice(0, oldKey.indexOf('::'));
+      const oldFile = oldKey.slice(oldKey.indexOf('::') + 2);
+      void (async () => {
+        try {
+          const fr = readFileReview(oldSessionDir, oldFile);
+          if (!fr) return;
+          const nowIso = new Date().toISOString();
+          fr.reviewedAt = nowIso;
+          fr.updatedAt = nowIso;
+          writeFileReview(oldSessionDir, fr);
+          onSessionsChanged?.();
+        } catch {
+          /* best-effort — the icon just stays off */
+        }
+      })();
+    }
+    tab.title = `Review: ${path.basename(filePath)}`;
+    if (oldKey) panels.delete(oldKey);
+    panels.set(key, tab);
+    panelKeys.set(tab, key);
+    reviewTabPanel = tab;
+    // The user clicked this file: make sure the tab is front and center.
+    tab.reveal(vscode.ViewColumn.One, false);
+    // The old file's draft is gone (discarded or never was) — never let it
+    // resurface in the close guard for the NEW file.
+    panelDrafts.delete(tab);
+    void createPanelContent(tab, sessionDir, manifest, filePath);
+    return;
+  }
+
+  const panel = vscode.window.createWebviewPanel(
+    'afterMathReview',
+    `Review: ${path.basename(filePath)}`,
+    vscode.ViewColumn.One,
+    { enableScripts: true, retainContextWhenHidden: true }
+  );
+  panels.set(key, panel);
+  panelKeys.set(panel, key);
+  if (!openInNewTab) reviewTabPanel = panel;
+  panel.onDidDispose(() => {
+    panels.delete(key);
+    panelKeys.delete(panel);
+    generations.get(panel)?.dispose();
+    generations.delete(panel);
+    const draft = panelDrafts.get(panel);
+    panelDrafts.delete(panel);
+    if (reviewTabPanel === panel) reviewTabPanel = undefined;
+    // "I have looked at this file": stamp the file's review record so the
+    // left panel can show the "discussion added" icon once HUMAN feedback
+    // (created after the last submission) exists. The agent's own feedback
+    // (initial review comments / its replies) predates this stamp, so it
+    // never counts as "the human added a discussion".
+    void (async () => {
+      try {
+        const session = readSession(sessionDir);
+        const fr = session?.files.find((x) => x.path === filePath);
+        if (!session || !fr) return;
+        fr.reviewedAt = new Date().toISOString();
+        fr.updatedAt = fr.reviewedAt;
+        writeFileReview(session.dir, fr);
+        onSessionsChanged?.();
+      } catch {
+        /* best-effort — the icon just stays off */
+      }
+    })();
+    if (draft) {
+      void (async () => {
+        const action = await vscode.window.showErrorMessage(
+          'The review tab was closed with an uncommitted discussion. Those changes were not posted to the session.',
+          { modal: true },
+          'Restore discussion',
+          'OK'
+        );
+        if (action !== 'Restore discussion') return;
+        const session = readSession(sessionDir);
+        if (!session) return;
+        await openReviewPanel(sessionDir, session.manifest, filePath, true);
+        const p = panels.get(sessionDir + '::' + filePath);
+        if (!p) return;
+        // Delivered once the webview's script is live (see the 'ready'
+        // handler in createPanelContent).
+        pendingRestores.set(p, draft);
+      })();
+    }
+  });
+  void createPanelContent(panel, sessionDir, manifest, filePath);
+}
+
+/**
+ * Wire up a (fresh or reused) review webview for one file: diff loading,
+ * initial send, file watchers and the message handler. Called for every new
+ * panel AND again when the reused tab is handed over to another file — the
+ * webview's document (and thus its script state: comment boxes, scroll
+ * position, un-posted text) is reset by the new HTML, so re-running this is
+ * exactly a fresh load.
+ */
+async function createPanelContent(
+  panel: vscode.WebviewPanel,
   sessionDir: string,
   manifest: Manifest,
   filePath: string
 ): Promise<void> {
   const key = sessionDir + '::' + filePath;
-  const existing = panels.get(key);
-  if (existing) {
-    existing.reveal();
-    return;
-  }
-
   const repoRoot = repoRootOf(sessionDir);
   const context = vscode.workspace
     .getConfiguration('afterMath')
@@ -180,36 +419,66 @@ export async function openReviewPanel(
   };
   // The diff (blocks + file stats) is recomputed on demand: it changes every
   // time the agent edits the file, so it must be re-derived, not cached.
+  // The BASE side is cached (git show baseRef never changes); only the
+  // working-tree read + LCS run per refresh.
   const refreshDiff = async (): Promise<void> => {
-    const base = (await getBaseLines(repoRoot, manifest.baseRef, filePath)) ?? [];
+    const base = (await cachedBaseLines(repoRoot, manifest.baseRef, filePath)) ?? [];
     const cur = getCurrentLines(repoRoot, filePath);
     const blocks = computeBlocks(base, cur, context);
     data.blocks = blocks;
     data.fileStats = statsOf(blocks);
   };
-  // The diff needs a git subprocess round-trip (git show baseRef) + an LCS
-  // pass — don't hold the panel open on it: the webview is created FIRST
-  // (with a loading state) and the data arrives a moment later. Session
-  // totals (a git show per file) run in the background the same way.
+  // The diff needs (first time) a git subprocess round-trip + an LCS pass —
+  // don't hold the panel open on it: the webview is created FIRST (with a
+  // loading state) and the data arrives a moment later. Session totals run
+  // in the background the same way — and ONLY when the session changed
+  // (manifest mtime), never on every keystroke of a file watcher.
   void refreshDiff().catch(() => {
     /* git hiccup — the next send will retry */
   });
-  void sessionStats(repoRoot, manifest, context).then((s) => {
-    data.sessionStats = s;
-  });
-
-  const panel = vscode.window.createWebviewPanel(
-    'afterMathReview',
-    `Review: ${path.basename(filePath)}`,
-    vscode.ViewColumn.One,
-    { enableScripts: true, retainContextWhenHidden: true }
-  );
-  panels.set(key, panel);
+  const manifestPath = path.join(sessionDir, 'manifest.json');
+  let manifestMtime = 0;
+  const sessionChanged = (): boolean => {
+    let m = 0;
+    try {
+      m = fs.statSync(manifestPath).mtimeMs;
+    } catch {
+      m = -1;
+    }
+    const changed = m !== manifestMtime;
+    manifestMtime = m;
+    return changed;
+  };
+  // Per-generation guard: the reused tab may be handed over (or closed)
+  // again while this load is still running — then this generation's sends
+  // and watchers must go quiet. Any PREVIOUS generation on this panel is
+  // cut off now, so its stale watchers can't fire on the new content.
+  generations.get(panel)?.dispose();
   let disposed = false;
-  panel.onDidDispose(() => {
+  let pendingSend: NodeJS.Timeout | undefined;
+  let watchers: vscode.FileSystemWatcher[] = [];
+  let genSub: vscode.Disposable | undefined;
+  let msgSub: vscode.Disposable | undefined;
+  const disposeGeneration = (): void => {
     disposed = true;
-    panels.delete(key);
-  });
+    if (pendingSend) clearTimeout(pendingSend);
+    for (const w of watchers) void w.dispose();
+    if (genSub) genSub.dispose();
+    if (msgSub) msgSub.dispose();
+  };
+  generations.set(panel, { dispose: disposeGeneration });
+  genSub = panel.onDidDispose(disposeGeneration);
+  // Kick off the (cached) session totals in the background — only when the
+  // session actually changed (manifest mtime); see sessionChanged().
+  if (sessionChanged()) {
+    void (async () => {
+      const s = await sessionStats(repoRoot, manifest, context);
+      if (disposed) return;
+      data.sessionStats = s;
+    })().catch(() => {
+      /* git hiccup — the next send will retry */
+    });
+  }
   const html = buildHtml();
   // The webview script is embedded in a template literal, so tsc never checks
   // it and TypeScript-isms (e.g. `x as T`) would silently kill the panel.
@@ -235,14 +504,19 @@ export async function openReviewPanel(
       /* git hiccup — keep the previously computed blocks */
     }
     if (disposed) return;
-    // Keep the session totals fresh without blocking the send: refresh in the
-    // background and re-send once the git show round-trips are done.
-    void sessionStats(repoRoot, manifest, context).then((s) => {
-      if (disposed) return;
-      const changed = s.added !== data.sessionStats.added || s.removed !== data.sessionStats.removed;
-      data.sessionStats = s;
-      if (changed) void panel.webview.postMessage({ type: 'data', data });
-    });
+    // Keep the session totals fresh without blocking the send — but only
+    // re-stat when the SESSION actually changed (manifest mtime moved): a
+    // full session stat is a file read + LCS per file, and running it on
+    // every watcher tick of ONE file's working-tree change is what made
+    // opening/switching files feel slow.
+    if (sessionChanged()) {
+      void sessionStats(repoRoot, manifest, context).then((s) => {
+        if (disposed) return;
+        const changed = s.added !== data.sessionStats.added || s.removed !== data.sessionStats.removed;
+        data.sessionStats = s;
+        if (changed) void panel.webview.postMessage({ type: 'data', data });
+      });
+    }
     void panel.webview.postMessage({ type: 'data', data });
   };
 
@@ -265,43 +539,55 @@ export async function openReviewPanel(
     });
   };
 
-  // Live updates: the agent edits the reviewed source file(s) and re-writes
-  // the review JSONs on disk (fixes, replies, re-submissions). Watching both
-  // the session folder and the file itself lets the panel refresh by itself
-  // instead of waiting for a VS Code reload. Debounced — the agent often
-  // rewrites several files back to back.
-  const watchers: vscode.FileSystemWatcher[] = [
-    // Glob separators are forward slashes even on Windows.
-    vscode.workspace.createFileSystemWatcher(sessionDir.replace(/\\/g, '/') + '/**'),
-    vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(repoRoot, filePath.replace(/\\/g, '/'))
-    ),
-  ];
-  let pendingSend: NodeJS.Timeout | undefined;
+  // Live updates: the agent edits the reviewed source file and re-writes the
+  // review JSONs on disk (fixes, replies, re-submissions). Watching only the
+  // ONE file under review (not the whole session folder — a session-wide
+  // ** glob fired for EVERY file in the session, re-running the full send —
+  // git base read + LCS diff + per-file session stats — on unrelated
+  // activity and made switching files feel slow) keeps the panel fresh
+  // without that cost. Debounced — the agent often rewrites files back to
+  // back. Cross-file session updates (another file's JSON, a re-submission)
+  // still arrive via the left panel's session watcher (tree + quick status
+  // push through notifyPanels) and the periodic scan.
+  const fileAbs = path.join(repoRoot, filePath);
+  watchers = [vscode.workspace.createFileSystemWatcher(fileAbs)];
+  const fileMtime = (): number => {
+    try {
+      return fs.statSync(fileAbs).mtimeMs;
+    } catch {
+      return -1;
+    }
+  };
+  let lastMtime = fileMtime();
   const onDiskChange = (): void => {
     if (disposed) return;
+    // Skip the notification if the file on disk is actually unchanged
+    // (watchers can fire for metadata-only events).
+    const m = fileMtime();
+    if (m === lastMtime) return;
+    lastMtime = m;
     if (pendingSend) clearTimeout(pendingSend);
     pendingSend = setTimeout(() => {
       pendingSend = undefined;
       void send();
       onSessionsChanged?.();
-    }, 600);
+    }, 300);
   };
   for (const w of watchers) {
     w.onDidCreate(onDiskChange);
     w.onDidChange(onDiskChange);
     w.onDidDelete(onDiskChange);
   }
-  panel.onDidDispose(() => {
-    if (pendingSend) clearTimeout(pendingSend);
-    for (const w of watchers) void w.dispose();
-  });
   void send();
 
-  panel.webview.onDidReceiveMessage(async (msg: {
+  msgSub = panel.webview.onDidReceiveMessage(async (msg: {
     type: string;
     line?: number;
+    col?: number;
+    character?: number;
+    file?: string;
     side?: 'left' | 'right';
+    action?: 'openFile' | 'goDef';
     text?: string;
     id?: string;
     ready?: boolean;
@@ -310,8 +596,93 @@ export async function openReviewPanel(
     commit?: CommitOptions;
     mode?: string;
   }) => {
+    // A 'reply' is the answer to an askWebview() round-trip (host-initiated)
+    // — not a user action.
+    if (msg.type === 'reply') return;
+    if (msg.type === 'codeHover') {
+      // Type info under the mouse (like the SCM diff's editor): run the
+      // language service for THIS file and send the answer back to the
+      // webview. Only TS/JS files produce a result.
+      if (msg.line === undefined) return;
+      if (isSupported(filePath)) {
+        const result = await lookup(repoRoot, filePath, msg.line, msg.col ?? 0);
+        if (!disposed) {
+          void panel.webview.postMessage({ type: 'hoverResult', line: msg.line, result });
+        }
+      }
+      return;
+    }
+    if (msg.type === 'codeContext') {
+      // Right-click a code line. Two actions (webview menu):
+      //  - openFile: open THIS file (the one under review) in a new editor tab.
+      //  - goDef: resolve the definition under the cursor and open THAT
+      //    file in a new tab, selecting the definition line.
+      if (msg.line === undefined) return;
+      const open = (rel: string, target?: { file: string; line: number; character: number }): void => {
+        void (async () => {
+          try {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(path.join(repoRoot, rel)));
+            const editor = await vscode.window.showTextDocument(doc, { preview: false });
+            if (target) {
+              const sel = new vscode.Selection(
+                Math.max(0, target.line - 1),
+                Math.max(0, target.character - 1),
+                Math.max(0, target.line - 1),
+                Math.max(0, target.character - 1)
+              );
+              editor.selection = sel;
+              editor.revealRange(sel, vscode.TextEditorRevealType.InCenter);
+            }
+          } catch {
+            /* definition target gone (deleted file) — nothing to open */
+          }
+        })();
+      };
+      if (msg.action === 'goDef') {
+        // Only TS/JS files can carry a definition; anything else (or a
+        // position with no symbol) has nowhere to jump to.
+        if (!isSupported(filePath)) return;
+        const result = await lookup(repoRoot, filePath, msg.line, msg.col ?? 0);
+        if (result?.definition) open(result.definition.file, result.definition);
+        return;
+      }
+      open(filePath); // action 'openFile' (and the legacy default)
+      return;
+    }
     if (msg.type === 'ready') {
+      // The script is live: deliver a one-shot draft restore (tab-close
+      // recovery) before the first data send.
+      const restore = pendingRestores.get(panel);
+      if (restore) {
+        pendingRestores.delete(panel);
+        void panel.webview.postMessage({ type: 'restoreDraft', text: restore });
+      }
       void send();
+      return;
+    }
+    if (msg.type === 'viewClosed') {
+      // The user is about to look at a DIFFERENT file (the reused tab is
+      // being handed over). Stamp this file as reviewed so the left panel
+      // can show the "discussion added" icon for the human feedback left in
+      // it — same effect as closing the tab, but at the moment of the
+      // view change.
+      try {
+        const fr = load();
+        const nowIso = new Date().toISOString();
+        fr.reviewedAt = nowIso;
+        fr.updatedAt = nowIso;
+        writeFileReview(sessionDir, fr);
+        onSessionsChanged?.();
+      } catch {
+        /* best-effort — the icon just stays off */
+      }
+      return;
+    }
+    if (msg.type === 'draft') {
+      // The un-posted discussion draft, mirrored to the host for the
+      // tab-close guard — not a session mutation.
+      if (typeof msg.text === 'string' && msg.text.trim() !== '') panelDrafts.set(panel, msg.text);
+      else panelDrafts.delete(panel);
       return;
     }
     try {
@@ -360,11 +731,28 @@ export async function openReviewPanel(
           notify = true;
           break;
         }
-        case 'resolveComment': {
-          // Resolve exactly ONE comment (by id), never the whole file.
-          const c = fr.comments.find((x) => x.id === msg.id);
-          if (c) {
-            c.resolved = true;
+        case 'resolveComments': {
+          // Resolve the WHOLE comment chain on this line (every comment
+          // anchored to it) — resolution is per chain, never per comment.
+          const any = fr.comments.some((c) => c.line === msg.line);
+          if (any) {
+            fr.comments.forEach((c) => {
+              if (c.line === msg.line) c.resolved = true;
+            });
+            fr.updatedAt = now;
+            writeFileReview(sessionDir, fr);
+            notify = true;
+          }
+          break;
+        }
+        case 'reopenComments': {
+          // Re-open the chain: flip every comment on this line back to open
+          // (the "✓ Resolved" footer button toggles it off).
+          const any = fr.comments.some((c) => c.line === msg.line && c.resolved);
+          if (any) {
+            fr.comments.forEach((c) => {
+              if (c.line === msg.line) c.resolved = false;
+            });
             fr.updatedAt = now;
             writeFileReview(sessionDir, fr);
             notify = true;
@@ -559,6 +947,8 @@ function buildHtml(): string {
   .stats.muted { opacity: 0.85; }
   button.gear { font-size: 14px; padding: 0 7px; line-height: 18px; }
   button.gear.on { outline: 1px solid var(--fg); }
+  /* Previous/next change-group navigation (left of Accept). */
+  button.navbtn { font-size: 12px; padding: 0 8px; line-height: 18px; }
   /* Settings menu: fixed so it stays visible while the diff is scrolled. */
   .settingsmenu { position: fixed; top: 74px; right: 8px; width: 280px; z-index: 60; background: var(--bg); border: 1px solid var(--border); border-left: 3px solid #6cb6ff; border-radius: 3px; padding: 8px 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
   .settingsmenu .settingsmenu-header { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #888; margin-bottom: 6px; }
@@ -573,8 +963,22 @@ function buildHtml(): string {
   .sessiongroup { display: flex; align-items: center; gap: 6px; border-left: 1px solid var(--border); padding-left: 10px; }
 
   /* 2px of padding on every side: the changed-line borders sit right at the
-     content edge and must never be clipped by the scroll container. */
+     content edge and must never be clipped by the scroll container. overflow
+     auto gives BOTH scrollbars: vertical for long files and horizontal when a
+     code line is wider than the view (the rows stretch to the longest line —
+     see .row code — so the bar appears on the WHOLE page, not per row). */
   #content { flex: 1; overflow: auto; padding: 2px 2px 14px; position: relative; }
+  /* --page-w is set by the script after every render to the width of the
+     WIDEST row anywhere in the file (see syncPageWidth). Percentages on a
+     scroll container's children resolve against the VISIBLE width, not the
+     scrollable one, so a fixed px minimum is the only way for a block to
+     stretch out to the longest line. */
+  /* Side-by-side hunks opt out of the page-wide horizontal scroll: sticky to
+     the LEFT (and right) edge of #content, so no matter how far the page is
+     scrolled horizontally the block stays in place, exactly as wide as the
+     view (current behavior). The two columns then scroll their code
+     independently — see .hunk-side .col. */
+  .hunk-side { position: sticky; left: 0; right: 0; }
 
   /* min-height (not just height): with empty content the flex children have
      zero height, so a plain height declaration collapses the row — every row,
@@ -591,9 +995,31 @@ function buildHtml(): string {
   /* The text area is a full-height box: a fixed height makes an EMPTY code
      span exactly one line tall (an empty inline span has no line box of its
      own, so line-height alone left it ~2 px). The border is NOT per row —
-     it is one square border around the whole contiguous change section. */
-  .row code, .cell code { flex: 1; height: var(--lh); overflow: hidden; text-overflow: ellipsis; }
+     it is one square border around the whole contiguous change section.
+     NOTE: no overflow:hidden here — that would disable the flex item's
+     automatic minimum size and the span would shrink to zero, ellipsizing
+     long lines instead of letting the row stretch. Rows stretch to the
+     longest line, so #content's overflow:auto produces the whole-page
+     horizontal scroll bar (and each side-by-side .col its own). */
+  .row code, .cell code { flex: 1 0 auto; min-width: 0; height: var(--lh); }
+  /* Every row spans the FULL width of the code (the widest line anywhere in
+     the file, --page-w — see syncPageWidth) so the line-number gutter and
+     the code area line up with every other row. */
+  .row { min-width: var(--page-w, 100%); }
   .chg { border: 1px solid var(--linec); }
+  /* Unified/hybrid change blocks span the FULL width of the code, not just
+     the view: the page scrolls horizontally as a whole, so the border and
+     the green/red line background must reach the end of the LONGEST line
+     anywhere in the file — not only of the widest line inside this block.
+     min-width: var(--page-w) stretches the block out to that width (set by
+     syncPageWidth after every render), so scrolling the horizontal bar
+     never leaves the block behind while other lines run past its border.
+     (A plain block box stays at the visible width and long lines run past
+     the border; fit-content only sized the box to THIS block's widest row,
+     which is what let code overlap it once the page scrolled.) Scoping to
+     :not(.col) leaves the side-by-side columns alone (flex items with their
+     own per-column horizontal scroll — side by side stays as it is). */
+  #content .chg:not(.col) { min-width: var(--page-w, 100%); }
   .chg.adds { --linec: var(--add-line); }
   .chg.dels { --linec: var(--del-line); }
   .chg.adds code { background: var(--add-bg); }
@@ -602,14 +1028,52 @@ function buildHtml(): string {
   .chg.dels .marker { color: var(--del-fg); }
   .row.ctx { color: var(--ctx-fg); }
 
+  /* Syntax coloring: the host sends the editor's own TextMate tokens for
+     the file (the same grammar engine the editor uses) and the webview maps
+     the scope chain onto a few broad classes — the default dark theme's
+     family of colors. A file with no grammar, or a reply that never
+     arrives, just renders plain text (no visual difference from before). */
+  code .tk-cmt { color: #6a9955; }
+  code .tk-str { color: #ce9178; }
+  code .tk-kw  { color: #c586c0; }
+  code .tk-const { color: #569cd6; }
+  code .tk-prop { color: #9cdcfe; }
+  code .tk-type { color: #4ec9b0; }
+  code .tk-fn  { color: #dcdcaa; }
+  code .tk-num { color: #b5cea8; }
+
   .addc { display: none; width: 16px; height: 16px; line-height: 14px; padding: 0; margin-right: 2px; font-size: 11px; border-radius: 3px; }
   .row:hover .addc, .cell:hover .addc { display: inline-block; }
 
   .badge { min-width: 16px; height: 15px; padding: 0 4px; font-size: 10px; border-radius: 8px; background: #b48a2a; color: #1e1e1e; font-weight: 700; display: inline-block; text-align: center; }
   .badge.resolved { background: #4a6a4a; color: #cfe8cf; }
 
+  /* Hover type tooltip (SCM-diff style): follows the mouse over a code line,
+     shows the symbol's signature + its declaration. Absolutely positioned
+     inside #content (position: relative) so it scrolls with the code and
+     never covers the toolbar. pointer-events: none — it must not steal the
+     mouse or the hover would flicker. */
+  .codetip { position: absolute; z-index: 70; max-width: 640px; background: var(--vscode-editorWidget-background, #252526); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); padding: 4px 8px; font-size: 12px; pointer-events: none; }
+  .codetip .ct-kind { font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; white-space: nowrap; }
+  .codetip .ct-text { font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; color: #999; white-space: pre-wrap; word-break: break-word; margin-top: 3px; max-height: 120px; overflow: hidden; }
+
+  /* Right-click context menu on a code line: VS Code-style floating menu
+     (fixed = stays put even though #content scrolls). */
+  .codectx { position: fixed; z-index: 80; min-width: 190px; background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526)); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); padding: 4px 0; font-size: 13px; }
+  .codectx .ctx-item { padding: 4px 16px; cursor: pointer; white-space: nowrap; }
+  .codectx .ctx-item:hover { background: var(--vscode-menu-selectionBackground, #04395e); }
+
   .hunk-side { display: flex; gap: 6px; }
-  .hunk-side .col { flex: 1; min-width: 0; }
+  /* Each column is an INDEPENDENT scroll box: it keeps exactly half the view
+     width (never pushed by the page-level horizontal scroll — .hunk-side is
+     pinned with position: sticky) and scrolls its OWN code horizontally when
+     a line is longer than the column. overflow-y is HIDDEN, not auto: a
+     column's height always fits its rows exactly, so with overflow:auto
+     the moment a horizontal bar appears (it eats ~15px of the box's height)
+     the content no longer fits VERTICALLY and a phantom vertical bar shows
+     up next to it. The one legit vertical case — a long removals side
+     capped by a max-height in renderSide — sets overflow-y: auto inline. */
+  .hunk-side .col { flex: 1; min-width: 0; max-width: 50%; overflow-x: auto; overflow-y: hidden; }
   .cell.ph { background: rgba(128,128,128,0.08); }
 
   /* Inline confirm/note dialog: fixed so it is always visible, contents
@@ -625,13 +1089,25 @@ function buildHtml(): string {
   .dialogbar .branchrow input[type="text"] { flex: 1; background: var(--vscode-input-background, #2a2a2a); color: var(--fg); border: 1px solid var(--border); font-family: inherit; font-size: 12.5px; padding: 3px 5px; }
 
   .editor { border: 1px solid var(--border); border-left: 3px solid #6cb6ff; margin: 4px 8px; padding: 8px; border-radius: 3px; }
-  .editor h4 { margin: 0 0 6px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #6cb6ff; }
+  /* Header row: the line title on the left, the minimize icon pinned to the
+     TOP RIGHT of the box (it collapses just this line's box). */
+  .editor .edhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+  .editor .edhead h4 { margin: 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #6cb6ff; }
+  button.minbtn { font-size: 12px; padding: 0 7px; line-height: 16px; }
   .editor .item { margin: 6px 0; padding: 6px; background: rgba(108,182,255,0.08); border-radius: 3px; font-size: 12.5px; }
   .editor .item.resolved { background: rgba(108,182,255,0.04); opacity: 0.75; }
   .editor .meta { color: #888; font-size: 11px; margin-top: 3px; }
-  .editor .itemactions { display: flex; gap: 6px; margin-top: 6px; }
+  /* The per-comment action row (pencil to edit / reopen) sits at the BOTTOM
+     of the whole comment block, right-aligned. Resolving is NOT per comment —
+     the whole chain is resolved by the box footer button. */
+  .editor .itemactions { display: flex; gap: 6px; margin-top: 6px; justify-content: flex-end; }
   .editor textarea { width: 100%; min-height: 44px; margin-top: 6px; background: var(--vscode-input-background, #2a2a2a); color: var(--fg); border: 1px solid var(--border); font-family: inherit; font-size: 12.5px; padding: 5px; resize: vertical; }
-  .editor .actions { display: flex; gap: 6px; margin-top: 6px; }
+  /* Box footer: "Mark Resolved" (resolves the WHOLE comment chain on this
+     line) pinned BOTTOM LEFT, "Submit Comment" pinned BOTTOM RIGHT. */
+  .editor .actions { display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-top: 6px; }
+  .editor .actions .left, .editor .actions .right { display: flex; gap: 6px; }
+  button.resolvebtn { color: var(--add-fg); }
+  button.resolvebtn.on { background: rgba(111,206,111,0.15); outline: 1px solid var(--add-fg); }
 
   /* The agent's brief reply, shown under the comment / discussion it answers. */
   .reply { margin-top: 6px; padding: 5px 7px; background: rgba(127,106,180,0.12); border-left: 2px solid #8b6fd0; border-radius: 2px; font-size: 12.5px; color: var(--fg); }
@@ -644,9 +1120,18 @@ function buildHtml(): string {
 
   #discussion { border-top: 1px solid var(--border); padding: 8px 10px; max-height: 40%; overflow: auto; }
   #discussion h4 { margin: 0 0 6px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; color: #888; }
-  #discussion .ditem { margin: 6px 0; padding: 6px 0; font-size: 12.5px; border-top: 1px solid var(--border); }
+  /* Each entry is a column: text on top, the answer/resolve action pinned to
+     the BOTTOM RIGHT of the whole entry (it works for that whole discussion,
+     not just the first line of text). */
+  #discussion .ditem { display: flex; flex-direction: column; align-items: flex-start; margin: 6px 0; padding: 6px 0; font-size: 12.5px; border-top: 1px solid var(--border); }
   #discussion .ditem:first-child { border-top: none; padding-top: 2px; }
   #discussion .ditem.answered { opacity: 0.7; }
+  /* pre-wrap: posted text keeps its ENTER (carriage return) line breaks —
+     esc() puts them into the HTML as real \n, which a normal div would
+     collapse into one line. pre-wrap renders them as line breaks (and
+     still wraps long lines). */
+  #discussion .dbody { width: 100%; min-width: 0; white-space: pre-wrap; word-wrap: break-word; }
+  #discussion .dfoot { display: flex; justify-content: flex-end; align-items: center; gap: 6px; margin-top: 4px; width: 100%; }
   #discussion .dmeta { color: #888; font-size: 11px; }
   #discussion .answerbtn { color: var(--add-fg); font-weight: 700; padding: 0 6px; }
   #discussion .answerpill { color: var(--add-fg); background: rgba(111,206,111,0.15); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; padding: 1px 7px; border-radius: 8px; }
@@ -675,10 +1160,12 @@ function buildHtml(): string {
   <div id="toolbar">
     <div class="trow trow-head">
       <span class="fname" id="fname"></span>
-      <span id="aiChip" class="aichip" hidden title="The agent changed this file since you last reviewed it — it has replied to your feedback.">✦ AI updated</span>
+      <span id="aiChip" class="aichip" hidden title="AI updated this file — the agent revised the code in response to your feedback.">✦ AI updated</span>
       <span id="statusChip"></span>
     </div>
     <div class="trow trow-actions">
+      <button id="btnPrevChange" class="navbtn" title="Jump to the previous group of changes" disabled>↑</button>
+      <button id="btnNextChange" class="navbtn" title="Jump to the next group of changes" disabled>↓</button>
       <button id="btnAccept" class="acceptbtn" title="Accept THIS file. The agent is NOT released — it keeps waiting until the whole review is committed (or you revise a file).">Accept</button>
       <button id="btnReady" class="readybtn" title="Release THIS file to the agent: it will start working on this file's open comments right away, without waiting for the rest of the review. Click again to take it back.">Revise</button>
       <span id="fileStats" class="stats" title="Added and removed lines in THIS file"></span>
@@ -717,6 +1204,207 @@ function buildHtml(): string {
   const vscode = acquireVsCodeApi();
   const LH = 21; // --lh (19 px) + the 2 px changed-line border; used for scroll math
   let data = null;
+  // Language of the file on display (derived from its extension when the
+  // data arrives). '' = unknown language, plain text.
+  let lang = '';
+  // True while a block comment (/* … */) is open across lines; each file's
+  // first rendered line resets it (line 1 can never be inside a block).
+  let blockOpen = false;
+  // Highlight cache: fileName -> (line text -> html). Re-renders while the
+  // user is reading (posting a comment, accepting, …) must not re-run the
+  // tokenizer over every visible line — only new file content does.
+  const tokCache = new Map();
+
+  // --- lightweight syntax highlighting -------------------------------------
+  // Runs entirely in the webview (the extension API has no tokenization
+  // endpoint) — a small set of per-language regexes colors comments,
+  // strings, numbers, keywords and identifiers. It is deliberately simple:
+  // each line is scanned left to right and the FIRST matching pattern wins,
+  // which keeps strings from swallowing the code after them. Unknown
+  // languages (or a line nothing matches) render exactly as before.
+  const LANGS = {
+    ts: {
+      line: /\\/\\/.*$/,
+      blocks: [/\\/\\*(?!\\*\\/)/, /\\*\\//],
+      str: /'(?:\\\\.|[^'\\\\\\n])*'?|"(?:\\\\.|[^"\\\\\\n])*"?|\\x60(?:\\\\.|[^\\x60\\\\])*\\x60?/,
+      num: /\\b0[xXbBoO][\\da-fA-F_]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b/,
+      kw: /\\b(?:abstract|as|async|await|break|case|catch|class|const|continue|debugger|declare|default|delete|do|else|enum|export|extends|false|finally|for|from|function|get|if|implements|import|in|instanceof|interface|is|let|namespace|new|null|of|private|protected|public|readonly|return|set|static|super|switch|this|throw|true|try|type|typeof|undefined|var|void|while|with|yield)\\b/,
+      fn: /\\b[A-Za-z_$][\\w$]*(?=\\s*\\()/,
+      type: /\\b[A-Z][A-Za-z0-9_$]*\\b/,
+    },
+    py: {
+      line: /#.*$/,
+      blocks: [],
+      str: /'(?:\\\\.|[^'\\\\\\n])*'?|"(?:\\\\.|[^"\\\\\\n])*"?/,
+      num: /\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?j?\\b/,
+      kw: /\\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|False|try|while|with|yield|self|cls)\\b/,
+      fn: /\\b[A-Za-z_][\\w]*(?=\\s*\\()/,
+      type: /\\b[A-Z][A-Za-z0-9_]*\\b/,
+    },
+    json: {
+      line: [],
+      blocks: [],
+      str: /"(?:\\\\.|[^"\\\\\\n])*"?/,
+      num: /-?\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b/,
+      kw: /\\b(?:true|false|null)\\b/,
+      prop: /"(?:\\\\.|[^"\\\\\\n])*"?(?=\\s*:)/,
+      fn: [],
+      type: [],
+    },
+    md: {
+      line: [],
+      blocks: [],
+      str: /\\x60[^\\x60]*\\x60?/,
+      num: [],
+      kw: /^#{1,6}\\s.*$|^\\s*[-*+]\\s.*$|^\\s*\\d+\\.\\s.*$|^\\s*>\\s.*$/,
+      prop: [],
+      fn: /\\[[^\\]]*\\]\\([^)]*\\)/,
+      type: [],
+    },
+    css: {
+      line: [],
+      blocks: [/\\/\\*/, /\\*\\//],
+      str: /'(?:\\\\.|[^'\\\\\\n])*'?|"(?:\\\\.|[^"\\\\\\n])*"?/,
+      num: /#[0-9a-fA-F]{3,8}\\b|-?\\b\\d[\\.]*(?:px|em|rem|%|vh|vw|s|ms|fr|deg)?\\b/,
+      kw: /\\b[a-z-]+(?=\\s*:)/,
+      prop: /\\b(?:at-\\w+|media|import|charset|supports)\\b/,
+      fn: [],
+      type: /\\.[-\\w]+|@[-\\w]+/,
+    },
+    java: {
+      line: /\\/\\/.*$/,
+      blocks: [/\\/\\*/, /\\*\\//],
+      str: /'(?:\\\\.|[^'\\\\\\n])*'?|"(?:\\\\.|[^"\\\\\\n])*"?/,
+      num: /\\b0[xXbBoO][\\da-fA-F_]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?[fFdDlL]?\\b/,
+      kw: /\\b(?:abstract|assert|boolean|break|byte|case|catch|char|class|const|continue|do|double|else|enum|extends|false|final|finally|float|for|goto|if|implements|import|instanceof|int|interface|long|native|new|null|package|private|protected|public|record|return|sealed|short|static|strictfp|super|switch|synchronized|this|throw|throws|transient|true|try|var|void|volatile|while|yield)\\b/,
+      fn: /\\b[a-z_$][\\w$]*(?=\\s*\\()/,
+      type: /\\b[A-Z][A-Za-z0-9_$]*\\b/,
+    },
+    go: {
+      line: /\\/\\/.*$/,
+      blocks: [/\\/\\*/, /\\*\\//],
+      str: /'(?:\\\\.|[^'\\\\\\n])*'?|"(?:\\\\.|[^"\\\\\\n])*"?|\\x60[^\\x60]*\\x60?/,
+      num: /\\b0[xXbBoO][\\da-fA-F_]+\\b|\\b\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b/,
+      kw: /\\b(?:break|case|chan|const|continue|default|defer|else|fallthrough|for|func|go|goto|if|import|interface|map|package|range|return|select|struct|switch|type|var|iota|nil|true|false)\\b/,
+      fn: /\\b[a-z_][\\w]*(?=\\s*\\()/,
+      type: /\\b[A-Z][A-Za-z0-9_]*\\b/,
+    },
+    sh: {
+      line: /#.*$/,
+      blocks: [],
+      str: /'(?:\\\\.|[^'\\\\\\n])*'?|"(?:\\\\.|[^"\\\\\\n])*"?/,
+      num: /\\b\\d+\\b/,
+      kw: /\\b(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|in|function|select|time|coproc)\\b/,
+      prop: /^\\s*(?:export|local|readonly|set|unset|alias|source|\\.|return|exit|break|continue)\\b/,
+      fn: /\\b[a-zA-Z_][\\w-]*(?=\\s*\\()/,
+      type: [],
+    },
+  };
+  const ALIASES = {
+    'tsx': 'ts', 'mts': 'ts', 'cts': 'ts', 'jsx': 'ts', 'js': 'ts', 'mjs': 'ts', 'cjs': 'ts',
+    'tsv': 'json', 'csv': 'json', 'yaml': 'py', 'yml': 'py',
+    'c': 'java', 'h': 'java', 'cpp': 'java', 'cc': 'java', 'cxx': 'java', 'hpp': 'java',
+    'cs': 'java', 'rs': 'java', 'swift': 'java', 'kt': 'java', 'kts': 'java', 'scala': 'java',
+    'lua': 'py', 'pl': 'py', 'r': 'py',
+  };
+  function langOf(name) {
+    const m = /\.([A-Za-z0-9]+)$/.exec(name || '');
+    if (!m) return '';
+    const e = m[1].toLowerCase();
+    return LANGS[e] ? e : ALIASES[e] || '';
+  }
+  // One line of code as HTML: colored when the language is known, escaped
+  // plain text otherwise. Cached per (file, line text).
+  function codeHtml(text) {
+    if (!lang || !text) return esc(text);
+    let byText = tokCache.get(data.fileName);
+    if (!byText) {
+      byText = new Map();
+      tokCache.set(data.fileName, byText);
+      if (tokCache.size > 8) {
+        const first = tokCache.keys().next().value;
+        tokCache.delete(first); // oldest file drops out (Map insertion order)
+      }
+    }
+    let html = byText.get(text);
+    if (html !== undefined) return html;
+    const L = LANGS[lang];
+    const blockRe = L.blocks ? L.blocks[1] : null; // block-comment CLOSER
+    // (re-read every iteration: closing a block flips it off mid-line)
+    let inBlock = blockOpen && !!blockRe;
+    const PATS = [
+      // The line-comment pattern is deliberately NOT anchored: // and #
+      // comments most often trail code on the same line.
+      [L.line, 'tk-cmt', false],
+      [L.blocks && L.blocks[0], 'tk-cmt', false],
+      // prop is tried before str: for JSON the prop pattern carries a (?=:)
+      // lookahead so it only claims key strings; value strings still fall
+      // through to str below.
+      [L.prop, lang === 'json' ? 'tk-prop' : 'tk-fn', false],
+      [L.str, 'tk-str', false],
+      [L.kw, 'tk-kw', false],
+      [L.num, 'tk-num', false],
+      [L.type, 'tk-type', false],
+      [L.fn, 'tk-fn', false],
+    ];
+    html = '';
+    let i = 0;
+    const put = (c, s) => {
+      if (!s) return;
+      html += (c ? '<span class="' + c + '">' : '') + esc(s) + (c ? '</span>' : '');
+    };
+    while (i < text.length) {
+      let m = null;
+      if (inBlock) {
+        blockRe.lastIndex = i;
+        m = blockRe.exec(text);
+        if (m) {
+          put('tk-cmt', text.slice(i, m.index + m[0].length));
+          i = m.index + m[0].length;
+          blockOpen = false;
+          inBlock = false;
+          continue;
+        }
+        put('tk-cmt', text.slice(i));
+        break;
+      }
+      const rest = text.slice(i);
+      // Patterns in priority order (ties at the same index go to the
+      // EARLIER pattern: a line comment beats a string, a string beats a
+      // keyword, …). First match in the rest of the line wins.
+      let best = null; // { idx, cls, re }
+      for (const p of PATS) {
+        const re = p[0];
+        // Empty-array slots (a language with no such pattern) are skipped.
+        if (!re || typeof re.exec !== 'function') continue;
+        re.lastIndex = 0;
+        const mm = re.exec(rest);
+        if (!mm) continue;
+        if (p[2] && mm.index !== 0) continue; // anchored: only at line start
+        if (!best || mm.index < best.idx) {
+          best = { idx: mm.index, cls: p[1], re: re };
+          if (mm.index === 0) break; // nothing can beat index 0
+        }
+      }
+      if (!best) {
+        put(null, text.slice(i));
+        break;
+      }
+      if (best.idx > 0) {
+        put(null, text.slice(i, i + best.idx));
+        i += best.idx;
+      }
+      best.re.lastIndex = 0;
+      const mm = best.re.exec(text.slice(i));
+      const matched = mm ? mm[0] : '';
+      put(best.cls, matched);
+      i += matched.length;
+      if (best.cls === 'tk-cmt' && L.blocks && L.blocks[0] && best.re === L.blocks[0]) blockOpen = true;
+      if (matched.length === 0) i++; // safety: never spin
+    }
+    byText.set(text, html);
+    return html;
+  }
   // Layout is a GLOBAL preference (host setting afterMath.layoutMode); the
   // webview mirrors it in the mode variable for instant UI feedback and the
   // host echoes the authoritative value back in the next data message.
@@ -727,6 +1415,12 @@ function buildHtml(): string {
   // never closes another.
   let commentBoxes = null;
   let editingId = null;
+  // Change-group navigation: one anchor per contiguous change group (its
+  // first bordered .chg block), in document order. currentChange indexes it.
+  let changeAnchors = [];
+  let currentChange = -1;
+  // The panel auto-scrolls to the first change exactly once on load.
+  let scrolledToFirstChange = false;
 
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -742,7 +1436,7 @@ function buildHtml(): string {
     if (commentable && no != null) {
       gutter += '<button class="addc" data-line="' + no + '" title="Add a comment on this line">+</button>';
     }
-    div.innerHTML = '<span class="gutter">' + gutter + '</span><span class="marker">' + marker + '</span><code>' + esc(text) + '</code>';
+    div.innerHTML = '<span class="gutter">' + gutter + '</span><span class="marker">' + marker + '</span><code>' + codeHtml(text) + '</code>';
     return div;
   }
 
@@ -759,7 +1453,7 @@ function buildHtml(): string {
     if (isAdd && l.no != null) div.setAttribute('data-newline', l.no);
     let gutter = '<span class="ln">' + (l.no != null ? l.no : '') + '</span>';
     if (isAdd) gutter += '<button class="addc" data-line="' + l.no + '" title="Add a comment on this line">+</button>';
-    div.innerHTML = '<span class="gutter">' + gutter + '</span><span class="marker">' + (isAdd ? '+' : '-') + '</span><code>' + esc(l.text) + '</code>';
+    div.innerHTML = '<span class="gutter">' + gutter + '</span><span class="marker">' + (isAdd ? '+' : '-') + '</span><code>' + codeHtml(l.text) + '</code>';
     return div;
   }
 
@@ -911,9 +1605,23 @@ function buildHtml(): string {
     const ed = document.createElement('div');
     ed.className = 'editor';
     ed.setAttribute('data-editorline', line);
+    // Header row: title left, minimize icon TOP RIGHT (collapses just this
+    // line's box; other lines keep their state).
+    const head = document.createElement('div');
+    head.className = 'edhead';
     const title = document.createElement('h4');
     title.textContent = 'Comments — line ' + line;
-    ed.appendChild(title);
+    const minBtn = document.createElement('button');
+    minBtn.className = 'minbtn';
+    minBtn.textContent = '▾'; // ▾
+    minBtn.title = 'Minimize the comment box for this line (the badge stays on the line to reopen it)';
+    minBtn.onclick = () => {
+      commentBoxes.set(line, false);
+      render();
+    };
+    head.appendChild(title);
+    head.appendChild(minBtn);
+    ed.appendChild(head);
     data.file.comments
       .filter((c) => c.line === line)
       .forEach((c) => {
@@ -928,40 +1636,52 @@ function buildHtml(): string {
           html += '<div class="reply"><span class="replylabel">Agent</span> ' + esc(c.reply) +
             (c.replyAt ? ' <span class="replyat">' + new Date(c.replyAt).toLocaleString() + '</span>' : '') + '</div>';
         }
-        if (c.resolved) {
-          // Resolved: no action buttons, just a pencil to reopen/edit.
-          html += '<div class="itemactions"><button class="editc" data-id="' + c.id + '" title="Edit this comment (reopens it)">&#9998;</button></div>';
-        } else {
-          html += '<div class="itemactions">' +
-            '<button class="editc" data-id="' + c.id + '" title="Edit this comment">&#9998;</button>' +
-            '<button data-act="resolve" data-id="' + c.id + '" title="Mark this one comment as resolved">Mark resolved</button>' +
-            '</div>';
-        }
+        // Per comment there is only the pencil (edit; reopen when resolved).
+        // Resolving is a CHAIN action — the box footer resolves every
+        // comment on this line at once.
+        html += '<div class="itemactions"><button class="editc" data-id="' + c.id + '" title="' + (c.resolved ? 'Edit this comment (reopens it)' : 'Edit this comment') + '">&#9998;</button></div>';
         item.innerHTML = html;
         ed.appendChild(item);
       });
     const ta = document.createElement('textarea');
     ta.placeholder = 'Add a comment…';
     ed.appendChild(ta);
+    // Footer: "Mark Resolved" BOTTOM LEFT (resolves the WHOLE comment chain —
+    // every comment on this line — not one comment), "Submit Comment"
+    // BOTTOM RIGHT.
     const actions = document.createElement('div');
     actions.className = 'actions';
+    const allResolved = data.file.comments.filter((c) => c.line === line).every((c) => c.resolved);
+    const resolve = document.createElement('button');
+    resolve.className = 'resolvebtn' + (allResolved ? ' on' : '');
+    resolve.textContent = allResolved ? '✓ Resolved' : 'Mark Resolved';
+    resolve.title = allResolved
+      ? 'This comment chain is resolved — click to open it again'
+      : 'Mark this whole comment chain (every comment on this line) as resolved';
+    resolve.onclick = () => {
+      if (allResolved) {
+        // Re-open the chain: flip every comment on this line back to open.
+        post({ type: 'reopenComments', line: line });
+      } else {
+        post({ type: 'resolveComments', line: line });
+      }
+    };
     const submit = document.createElement('button');
-    submit.textContent = 'Comment';
+    submit.textContent = 'Submit Comment';
     submit.title = 'Add your comment to this line';
     submit.onclick = () => {
       const text = ta.value.trim();
       if (!text) return;
       post({ type: 'addComment', line: line, side: 'right', text: text });
     };
-    const cancel = document.createElement('button');
-    cancel.textContent = 'Close';
-    cancel.title = 'Collapse the comment box for this line (other lines stay as they are)';
-    cancel.onclick = () => {
-      commentBoxes.set(line, false);
-      render();
-    };
-    actions.appendChild(submit);
-    actions.appendChild(cancel);
+    const left = document.createElement('div');
+    left.className = 'left';
+    left.appendChild(resolve);
+    const right = document.createElement('div');
+    right.className = 'right';
+    right.appendChild(submit);
+    actions.appendChild(left);
+    actions.appendChild(right);
     ed.appendChild(actions);
     return ed;
   }
@@ -1072,6 +1792,10 @@ function buildHtml(): string {
 
   function renderDiscussion() {
     const list = document.getElementById('dList');
+    const box = document.getElementById('discussion');
+    // Re-renders (post, answer, quick status) must not yank the discussion
+    // box back to the top while the user is reading it.
+    const prevScroll = box ? box.scrollTop : 0;
     list.innerHTML = '';
     data.file.discussion.forEach((d) => {
       const div = document.createElement('div');
@@ -1083,22 +1807,35 @@ function buildHtml(): string {
       const who = isAgentAuthor(d.author)
         ? '<span class="who agent" title="Written by the AI agent">' + robotIcon() + '<span class="who-name">' + esc(agentDisplayName()) + '</span></span>'
         : '<span class="who human" title="Written by you">You</span>';
-      let html = who + esc(d.text) + revisedPill + ' <span class="dmeta">— ' + esc(d.author) + ' · ' + new Date(d.createdAt).toLocaleString() + (d.answered ? ' · answered' : '') + (d.revised === true ? ' · revised by agent' : '') + '</span>';
+      // Body: who + text (newlines preserved) + revised pill + meta + reply.
+      const body = document.createElement('div');
+      body.className = 'dbody';
+      body.innerHTML = who + esc(d.text) + revisedPill +
+        '<div class="dmeta">— ' + esc(d.author) + ' · ' + new Date(d.createdAt).toLocaleString() + (d.answered ? ' · answered' : '') + (d.revised === true ? ' · revised by agent' : '') + '</div>';
+      if (d.reply) {
+        // The agent's brief reply to this entry.
+        const reply = document.createElement('div');
+        reply.className = 'reply';
+        reply.innerHTML = '<span class="replylabel">Agent</span> ' + esc(d.reply) +
+          (d.replyAt ? ' <span class="replyat">' + new Date(d.replyAt).toLocaleString() + '</span>' : '');
+        body.appendChild(reply);
+      }
+      div.appendChild(body);
+      // Footer: the answer/resolve action pinned to the BOTTOM RIGHT of the
+      // whole entry (it applies to that whole discussion entry).
+      const foot = document.createElement('div');
+      foot.className = 'dfoot';
       if (d.answered) {
         // Visible "answered" indicator (green pill); clicking it re-opens
         // the entry (back to unanswered).
-        html += ' <button class="answerpill" data-dact="unanswer" data-id="' + d.id + '" title="Answered — click to open this entry again">✓ answered</button>';
+        foot.innerHTML = '<button class="answerpill" data-dact="unanswer" data-id="' + d.id + '" title="Answered — click to open this entry again">✓ answered</button>';
       } else {
-        html += ' <button data-dact="answer" data-id="' + d.id + '" class="answerbtn" title="Mark this discussion entry as answered">✓</button>';
+        foot.innerHTML = '<button data-dact="answer" data-id="' + d.id + '" class="answerbtn" title="Mark this discussion entry as answered">✓</button>';
       }
-      if (d.reply) {
-        // The agent's brief reply to this entry.
-        html += '<div class="reply"><span class="replylabel">Agent</span> ' + esc(d.reply) +
-          (d.replyAt ? ' <span class="replyat">' + new Date(d.replyAt).toLocaleString() + '</span>' : '') + '</div>';
-      }
-      div.innerHTML = html;
+      div.appendChild(foot);
       list.appendChild(div);
     });
+    if (box) box.scrollTop = prevScroll;
   }
 
   // Is this author the session's code reviewer (the AI agent)? Compared
@@ -1135,6 +1872,31 @@ function buildHtml(): string {
     return '<span class="add">+' + s.added + '</span> <span class="del">-' + s.removed + '</span>';
   }
 
+  // Size --page-w on #content to the widest row anywhere in the rendered
+  // diff (a row's scrollWidth = gutter + marker + its full, untruncated
+  // pre-formatted line). Change blocks and rows take this as their
+  // min-width, so the bordered change box fills the ENTIRE width of the
+  // code: when the horizontal scrollbar is scrolled, the box stays as wide
+  // as the longest line instead of being left behind by the code. A couple
+  // of passes — stretching the rows to the new width can only ever make
+  // them measure the same width back (scrollWidth >= content), so this
+  // converges immediately.
+  function syncPageWidth() {
+    const content = document.getElementById('content');
+    if (!content) return;
+    let w = 0;
+    for (let pass = 0; pass < 3; pass++) {
+      let widest = 0;
+      content.querySelectorAll('.row').forEach((r) => {
+        if (r.scrollWidth > widest) widest = r.scrollWidth;
+      });
+      if (widest <= w) break;
+      w = widest;
+      content.style.setProperty('--page-w', w + 'px');
+    }
+    if (w === 0) content.style.removeProperty('--page-w');
+  }
+
   // The status UI only (status pill, accept/revise buttons, file counters,
   // AI-updated chip) — factored out of render() so the host's quick status
   // push can flip it WITHOUT re-rendering the diff.
@@ -1146,9 +1908,15 @@ function buildHtml(): string {
     const chip = document.getElementById('statusChip');
     chip.textContent = data.file.status.replace('_', ' ');
     chip.className = 'chip-' + data.file.status;
-    // "AI updated" marker: the agent changed this file since the last review.
+    // "AI updated this file": only after a revision round — the agent changed
+    // the code in response to feedback (revised: true on the comment or
+    // discussion entry, alongside its reply). Never on the initial review,
+    // where the file keeps its pencil / + / - icon.
+    const revisedFeedback =
+      data.file.comments.some((c) => c.revised === true) ||
+      data.file.discussion.some((d) => d.revised === true);
     document.getElementById('aiChip').hidden =
-      !(data.file.agentTouched === true && data.file.status !== 'accepted');
+      !(revisedFeedback && data.file.status !== 'accepted');
     const readyBtn = document.getElementById('btnReady');
     const on = data.file.ready === true;
     readyBtn.classList.toggle('on', on);
@@ -1168,8 +1936,229 @@ function buildHtml(): string {
     prBtn.title = 'Let the agent commit the changes — to a local branch or as a pull request (your choice in the dialog). Files you have not accepted yet are accepted too, after you confirm.';
   }
 
+  // Jump the diff view to change group i (smooth). The anchor's TOP is
+  // aligned with the top of #content, so the whole group is visible from its
+  // first line — including groups whose border is a few context lines below
+  // the hunk element's top.
+  function jumpToChange(i) {
+    const content = document.getElementById('content');
+    const el = changeAnchors[i];
+    if (!el) return;
+    currentChange = i;
+    content.scrollTo({ top: el.offsetTop, behavior: 'smooth' });
+    updateChangeButtons();
+  }
+
+  // Derive which change group is CURRENT from where the view actually is —
+  // buttons AND manual scrolling both move the view, so the buttons must
+  // follow the scroll position (otherwise they wrap/gray out out of sync
+  // with the view). current = the last group whose top is at or above the
+  // viewport top + a small epsilon (the group the user is reading now).
+  function syncChangeFromScroll() {
+    const content = document.getElementById('content');
+    const top = content.scrollTop;
+    let cur = -1;
+    for (let i = 0; i < changeAnchors.length; i++) {
+      if (changeAnchors[i].offsetTop <= top + 8) cur = i;
+    }
+    currentChange = cur;
+    updateChangeButtons();
+  }
+
+  function updateChangeButtons() {
+    const prev = document.getElementById('btnPrevChange');
+    const next = document.getElementById('btnNextChange');
+    // No wrap-around: at the last group "next" is disabled (staying put), at
+    // the first group "prev" is disabled. Before the first group (top of
+    // page, no group visible yet) only "next" is enabled.
+    prev.disabled = currentChange <= 0;
+    next.disabled = currentChange < 0 || currentChange >= changeAnchors.length - 1;
+  }
+
+  // Scroll listener: keep the buttons in sync with MANUAL scrolling (rAF-
+  // throttled so a fast fling costs one pass per frame).
+  let scrollRaf = 0;
+  document.getElementById('content').addEventListener('scroll', () => {
+    if (scrollRaf) return;
+    scrollRaf = requestAnimationFrame(() => {
+      scrollRaf = 0;
+      syncChangeFromScroll();
+    });
+  });
+
+  // Previous / next group of changes (the two buttons left of Accept).
+  // Clamped, never wrapping: hitting ↓ at the bottom stays put (button
+  // grayed out), hitting ↑ at the top stays put.
+  document.getElementById('btnPrevChange').onclick = () => {
+    if (currentChange < 0) { currentChange = 0; updateChangeButtons(); return; }
+    jumpToChange(Math.max(0, currentChange - 1));
+  };
+  document.getElementById('btnNextChange').onclick = () => {
+    if (currentChange < 0) { jumpToChange(0); return; }
+    if (currentChange >= changeAnchors.length - 1) return; // already at the bottom
+    jumpToChange(currentChange + 1);
+  };
+
+  // --- code hover type info + right-click context menu ---------------------
+  // The webview is plain HTML (no editor), so type info comes from the host's
+  // TypeScript language service: hovering a code line round-trips
+  // {line, column} and the answer renders as an SCM-diff-style tooltip.
+  let hoverTimer = 0;
+  let hoverToken = 0;
+  let hoverState = null; // { line, col, x, y, row } — the line under the mouse
+  let hoverTipEl = null;
+  let ctxMenuEl = null;
+  let measureSpan = null; // hidden span used to measure the monospace char width
+
+  function charWidth() {
+    if (!measureSpan) {
+      measureSpan = document.createElement('span');
+      measureSpan.style.cssText = 'position:absolute;visibility:hidden;white-space:pre;font-family:var(--vscode-editor-font-family, monospace);font-size:12.5px;';
+      measureSpan.textContent = '00000000000000000000000000000000';
+      document.body.appendChild(measureSpan);
+    }
+    const w = measureSpan.getBoundingClientRect().width / measureSpan.textContent.length;
+    return w > 0 ? w : 7.6;
+  }
+  /** 0-based column under the mouse, from the code span's own geometry. */
+  function colAt(codeEl, clientX) {
+    const r = codeEl.getBoundingClientRect();
+    if (clientX <= r.left) return 0;
+    return Math.min(5000, Math.max(0, Math.floor((clientX - r.left) / charWidth())));
+  }
+
+  function closeHoverTip() {
+    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = 0; }
+    hoverToken++; // invalidate any in-flight answer
+    hoverState = null;
+    if (hoverTipEl) { hoverTipEl.remove(); hoverTipEl = null; }
+  }
+
+  function placeHoverTip() {
+    if (!hoverTipEl || !hoverState) return;
+    const content = document.getElementById('content');
+    const cr = content.getBoundingClientRect();
+    // Absolute inside #content: page coords minus the content box, plus the
+    // current scroll (the tip must stick to the CODE, not the viewport).
+    let left = hoverState.x - cr.left + content.scrollLeft + 14;
+    let top = hoverState.y - cr.top + content.scrollTop + 16;
+    const tw = hoverTipEl.offsetWidth;
+    const th = hoverTipEl.offsetHeight;
+    // Flip up / left when the tip would run past the visible box.
+    if (left + tw > content.clientWidth - 6) left = hoverState.x - cr.left + content.scrollLeft - tw - 14;
+    if (top + th > content.clientHeight - 6) top = Math.max(4, hoverState.y - cr.top + content.scrollTop - th - 12);
+    if (left < 4) left = 4;
+    if (top < 4) top = 4;
+    hoverTipEl.style.left = left + 'px';
+    hoverTipEl.style.top = top + 'px';
+  }
+
+  function onCodeMouseMove(e) {
+    const code = e.target.closest ? e.target.closest('code') : null;
+    // '.row' (unified/hybrid) or '.cell' (side-by-side); only the current
+    // (add) side carries data-newline, so deleted lines stay inert.
+    const row = code ? (code.closest('.row') || code.closest('.cell')) : null;
+    const line = row ? row.getAttribute('data-newline') : null;
+    if (!code || !row || line === null || !data || !isSupportedFile(data.fileName)) {
+      closeHoverTip();
+      return;
+    }
+    const col = colAt(code, e.clientX);
+    hoverState = { line: parseInt(line, 10), col: col, x: e.clientX, y: e.clientY, row: row };
+    if (hoverTipEl) placeHoverTip(); // stick to the mouse while already shown
+    if (hoverTimer) clearTimeout(hoverTimer);
+    const token = ++hoverToken;
+    const lineNo = hoverState.line;
+    const colNo = hoverState.col;
+    hoverTimer = setTimeout(() => {
+      hoverTimer = 0;
+      if (token !== hoverToken || !hoverState || hoverState.line !== lineNo || hoverState.col !== colNo) return;
+      post({ type: 'codeHover', line: lineNo, col: colNo });
+    }, 350);
+  }
+
+  function isSupportedFile(name) {
+    const e = (name || '').split('.').pop().toLowerCase();
+    return ['ts', 'tsx', 'js', 'jsx', 'mts', 'cts', 'mjs', 'cjs'].includes(e);
+  }
+
+  // Delegated on document.body: comment boxes and the gutter are inside
+  // #content too, and the menu must close when the mouse leaves the code.
+  document.body.addEventListener('mousemove', (e) => {
+    const t = e.target;
+    const overCode = t instanceof Element && t.closest && t.closest('#content code');
+    if (overCode) onCodeMouseMove(e);
+    else if (hoverTipEl || hoverTimer) closeHoverTip();
+  });
+  document.getElementById('content').addEventListener('scroll', closeHoverTip);
+
+  function closeCtxMenu() {
+    if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; }
+  }
+
+  document.body.addEventListener('contextmenu', (e) => {
+    const t = e.target;
+    const code = t instanceof Element && t.closest ? t.closest('#content code') : null;
+    // '.row' (unified/hybrid) or '.cell' (side-by-side) — both carry
+    // data-newline on the current (add) side.
+    const row = code ? (code.closest('.row') || code.closest('.cell')) : null;
+    const lineAttr = row ? row.getAttribute('data-newline') : null;
+    if (!code || !row || lineAttr === null) { closeCtxMenu(); return; }
+    e.preventDefault();
+    closeHoverTip();
+    closeCtxMenu();
+    const lineNo = parseInt(lineAttr, 10);
+    const colNo = colAt(code, e.clientX);
+    const menu = document.createElement('div');
+    menu.className = 'codectx';
+    const mkItem = (text, title, action) => {
+      const item = document.createElement('div');
+      item.className = 'ctx-item';
+      item.textContent = text;
+      item.title = title;
+      item.onclick = () => {
+        closeCtxMenu();
+        post({ type: 'codeContext', line: lineNo, col: colNo, action: action });
+      };
+      menu.appendChild(item);
+    };
+    mkItem('Go to Definition', 'Open the file containing the definition of this symbol in a new tab', 'goDef');
+    mkItem('Open File in New Tab', 'Open this file (the one under review) in a new editor tab', 'openFile');
+    document.body.appendChild(menu);
+    // Keep the menu inside the viewport.
+    const mw = menu.offsetWidth;
+    const mh = menu.offsetHeight;
+    let mx = e.clientX;
+    let my = e.clientY;
+    if (mx + mw > window.innerWidth - 4) mx = Math.max(4, window.innerWidth - mw - 4);
+    if (my + mh > window.innerHeight - 4) my = Math.max(4, window.innerHeight - mh - 4);
+    menu.style.left = mx + 'px';
+    menu.style.top = my + 'px';
+    ctxMenuEl = menu;
+    // Dismiss on any click / escape / scroll that is not the menu itself.
+    const dismiss = (ev) => {
+      if (ctxMenuEl && !ctxMenuEl.contains(ev.target)) closeCtxMenu();
+      document.removeEventListener('click', dismiss, true);
+      document.removeEventListener('scroll', dismiss, true);
+      document.removeEventListener('keydown', onKey, true);
+    };
+    const onKey = (ev) => {
+      if (ev.key === 'Escape') closeCtxMenu();
+    };
+    setTimeout(() => {
+      document.addEventListener('click', dismiss, true);
+      document.addEventListener('scroll', dismiss, true);
+      document.addEventListener('keydown', onKey, true);
+    }, 0);
+  });
+
   function render() {
+    closeHoverTip(); // the tip lives inside #content, which render() replaces
     if (!data) return;
+    // (Re)derive the file's language and reset the block-comment state —
+    // the first line rendered can never be inside a /* … */ started earlier.
+    lang = langOf(data.fileName);
+    blockOpen = false;
     const loading = document.getElementById('loading');
     if (loading) loading.remove();
     document.getElementById('fname').textContent = data.fileName;
@@ -1182,8 +2171,13 @@ function buildHtml(): string {
     });
     applyStatusUi();
     const content = document.getElementById('content');
+    // Remember where the user is (re-renders must not yank the view back to
+    // the top or to the first change — data messages arrive on every
+    // comment/accept/status change while they are reading).
+    const prevScroll = scrolledToFirstChange ? content.scrollTop : 0;
     content.innerHTML = '';
     const ctxRow = (l) => rowLine('ctx', l.no, l.text, '', true);
+    const hunkEls = []; // rendered element for each change group, in order
     data.blocks.forEach((b) => {
       if (b.kind === 'context') {
         const wrap = document.createElement('div');
@@ -1198,6 +2192,7 @@ function buildHtml(): string {
           (mode === 'hybrid' && twoSided && b.oldLines.length + b.newLines.length >= data.hybridThreshold);
         if (sideBySide) {
           content.appendChild(renderHunk(b));
+          hunkEls.push(content.lastChild);
         } else {
           const wrap = document.createElement('div');
           // The whole contiguous change (removed lines followed by added
@@ -1223,11 +2218,33 @@ function buildHtml(): string {
           }
           b.contextAfter.forEach((l) => wrap.appendChild(ctxRow(l)));
           content.appendChild(wrap);
+          hunkEls.push(wrap);
         }
       }
     });
     attachBadges();
     renderDiscussion();
+    // Stretch change blocks + rows to the widest line of the WHOLE file so
+    // the horizontal scroll never separates the change box from the code.
+    syncPageWidth();
+    // Change-group navigation: anchor each rendered change group at its first
+    // bordered block (in side-by-side the first .chg is the additions column;
+    // in unified it is the red removals run or the single line's border).
+    changeAnchors = hunkEls.map((el) => {
+      const chg = el.querySelector('.chg');
+      return chg || el;
+    });
+    // First load only: scroll straight to the first group of changes.
+    if (!scrolledToFirstChange && changeAnchors.length > 0) {
+      scrolledToFirstChange = true;
+      currentChange = 0;
+      jumpToChange(0);
+    } else {
+      // Subsequent renders: restore the reading position (the re-render may
+      // have grown/shrunk the content above the viewport).
+      content.scrollTop = prevScroll;
+      syncChangeFromScroll();
+    }
   }
 
   // Delegated from document.body (NOT just #content): the "answer" button
@@ -1251,12 +2268,6 @@ function buildHtml(): string {
       const c = data.file.comments.find((x) => x.id === id);
       const itemEl = el.closest('.item');
       if (c && itemEl) startEdit(itemEl, c);
-      return;
-    }
-    const res = el.closest('[data-act="resolve"]');
-    if (res) {
-      // Resolve exactly the one comment this button belongs to.
-      post({ type: 'resolveComment', id: res.getAttribute('data-id') });
       return;
     }
     const ans = el.closest('[data-dact="answer"]');
@@ -1328,21 +2339,80 @@ function buildHtml(): string {
     const text = ta.value.trim();
     if (!text) return;
     ta.value = '';
+    post({ type: 'draft', text: '' }); // draft is no longer un-posted
     post({ type: 'addDiscussion', text: text });
   };
+  // Mirror the un-posted discussion draft to the host on every change — the
+  // tab-close guard (the host cannot cancel a webview panel's dispose).
+  const dInputBox = document.getElementById('dInput');
+  dInputBox.addEventListener('input', () => {
+    post({ type: 'draft', text: dInputBox.value });
+  });
   document.getElementById('dInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) document.getElementById('dPost').click();
   });
 
+  // Briefly outlines the discussion box so a "Cancel" lands the user right on
+  // their un-posted text.
+  function flashDiscussion() {
+    const box = document.getElementById('discussion');
+    box.style.outline = '2px solid #6cb6ff';
+    box.style.outlineOffset = '-2px';
+    setTimeout(() => {
+      box.style.outline = '';
+      box.style.outlineOffset = '';
+    }, 1200);
+  }
+
   window.addEventListener('message', (e) => {
     const msg = e.data;
+    // Host round-trips (askWebview): the host asks about / acts on the
+    // un-posted discussion before taking this tab over or closing it.
+    if (msg.type === 'hasUnposted') {
+      vscode.postMessage({ type: 'reply', id: msg.id, value: document.getElementById('dInput').value.trim().length > 0 });
+      return;
+    }
+    if (msg.type === 'viewClosed') {
+      // The host is about to swap this tab to a DIFFERENT file (the user
+      // picked another file in the left panel). Acknowledge — the host does
+      // the reviewed-stamp write itself.
+      vscode.postMessage({ type: 'reply', id: msg.id, value: true });
+      return;
+    }
+    if (msg.type === 'gotoUnposted') {
+      const dInput = document.getElementById('dInput');
+      document.getElementById('discussion').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      dInput.focus();
+      flashDiscussion();
+      return;
+    }
+    if (msg.type === 'clearUnposted') {
+      const ta = document.getElementById('dInput');
+      ta.value = '';
+      post({ type: 'draft', text: '' });
+      return;
+    }
+    if (msg.type === 'restoreDraft') {
+      // The host restored an un-posted draft after its tab was closed.
+      const ta = document.getElementById('dInput');
+      ta.value = String(msg.text ?? '');
+      post({ type: 'draft', text: ta.value });
+      document.getElementById('discussion').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      ta.focus();
+      flashDiscussion();
+      return;
+    }
     if (msg.type === 'data') {
       // fileCounts is session-wide: keep it fresh from every data message.
       if (data && msg.data.fileCounts) data.fileCounts = msg.data.fileCounts;
+      const prevFile = data ? data.fileName : null;
       data = msg.data;
       // The layout is a global preference: adopt the host's authoritative
       // value (covers other panels and the initial load).
       if (msg.data.layoutMode && msg.data.layoutMode !== mode) mode = msg.data.layoutMode;
+      // The tab was handed to a DIFFERENT file: drop the old file's
+      // highlight cache so its lines can't leak into the new file's view.
+      if (prevFile && prevFile !== data.fileName) tokCache.delete(prevFile);
       reanchorStaleComments();
       render();
     }
@@ -1359,6 +2429,37 @@ function buildHtml(): string {
       if (msg.fileCounts) data.fileCounts = msg.fileCounts;
       if (typeof msg.sessionOpen === 'boolean') data.sessionOpen = msg.sessionOpen;
       applyStatusUi();
+    }
+    if (msg.type === 'hoverResult') {
+      // Answer to a codeHover round-trip. If the mouse has moved ONTO ANOTHER
+      // LINE while the (first, slow) lookup ran, the answer is for a line
+      // the user already left — a small drift (a few lines) is fine, the
+      // symbol is almost always the same; a big jump is discarded.
+      if (!hoverState) {
+        closeHoverTip();
+        return;
+      }
+      if (Math.abs(msg.line - hoverState.line) > 3) {
+        closeHoverTip();
+        return;
+      }
+      if (!msg.result || !msg.result.hover) {
+        closeHoverTip();
+        return;
+      }
+      if (!hoverTipEl) {
+        hoverTipEl = document.createElement('div');
+        hoverTipEl.className = 'codetip';
+        const content = document.getElementById('content');
+        if (content) content.appendChild(hoverTipEl);
+      }
+      const h = msg.result.hover;
+      const callHint = h.callable ? ' <span style="color:#888">()  (call)</span>' : '';
+      hoverTipEl.innerHTML =
+        '<div class="ct-kind">' + esc(h.kind) + callHint + '</div>' +
+        (h.text && h.text !== h.kind ? '<div class="ct-text">' + esc(h.text) + '</div>' : '');
+      placeHoverTip();
+      return;
     }
     if (msg.type === 'readyBlocked') {
       note(msg.reason === 'no-feedback' ? 'Add a comment or a discussion entry to this file first — Revise releases your feedback to the agent, so there is nothing to release yet.' : 'This file cannot be released to the agent right now.');

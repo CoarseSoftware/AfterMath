@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { FileReview, Session, fileHasAgentChanges, hasOpenFeedback, hasRevisedFeedback, isReleasable, isSessionFinalized, listSessions, writeFileReview } from '@aftermath/protocol';
+import { FileReview, Session, fileHasAgentChanges, hasHumanDiscussionSince, hasOpenFeedback, hasRevisedFeedback, isReleasable, isSessionFinalized, listSessions, writeFileReview } from '@aftermath/protocol';
 import { notifyPanels, openReviewPanel, setSessionsChangedListener } from './reviewPanel';
 
 const SCAN_INTERVAL_MS = 10_000;
@@ -34,12 +34,19 @@ class FileItem extends vscode.TreeItem {
     const openComments = fr.comments.filter((c) => !c.resolved).length;
     const openDiscussion = fr.discussion.filter((d) => !d.answered).length;
     const revised = hasRevisedFeedback(fr);
+    // "I looked at this file and left a discussion": the user closed the
+    // review view for this file (reviewedAt stamp) AFTER which they added a
+    // comment / discussion entry. Distinguishes "already looked at + spoke"
+    // from "agent's initial review feedback" (which predates the stamp).
+    const discussionAdded = hasHumanDiscussionSince(fr, fr.reviewedAt);
 
     // Single-row tree item: file name (label) + a status "pill" and any detail
     // in the description. This API's TreeItem label has no markdown/multi-line
     // support, so everything lives on one line and long names simply truncate.
     const detailParts: string[] = [];
-    if (changed) detailParts.push('AI updated this file');
+    // "AI updated this file" only after a revision round (see fileIcon).
+    if (changed && revised) detailParts.push('AI updated this file');
+    if (discussionAdded) detailParts.push('discussion added');
     if (fr.ready) detailParts.push('released');
     if (hasOpenFeedback(fr) && detailParts.length === 0) detailParts.push('open feedback');
     if (openComments > 0) detailParts.push(`${openComments} open comment${openComments === 1 ? '' : 's'}`);
@@ -55,15 +62,16 @@ class FileItem extends vscode.TreeItem {
       fr.path +
       '\n' +
       fr.status +
-      (changed ? ' — AI updated this file' : '') +
+      (changed && revised ? ' — AI updated this file' : '') +
+      (discussionAdded ? ' — discussion added (you looked at this)' : '') +
       (openComments ? ` — ${openComments} open comment(s)` : '') +
       (openDiscussion ? ` — ${openDiscussion} open discussion` : '') +
       (this.fr.ready ? ' — released to the agent (waiting on the AI)' : '');
     // deleted / added / edit — drives the red "-", yellow "+" or pencil icon.
     const kind = fileChangeKind(fr, repoRootOf(session.dir), session.manifest.baseRef);
     this.iconPath = new vscode.ThemeIcon(
-      fileIcon(fr, openComments, openDiscussion, fr.ready === true, changed, revised, session.manifest.agent, kind),
-      new vscode.ThemeColor(fileIconColor(fr.status, fr.ready === true, changed, revised, kind))
+      fileIcon(fr, openComments, openDiscussion, fr.ready === true, changed, revised, discussionAdded, session.manifest.agent, kind),
+      new vscode.ThemeColor(fileIconColor(fr.status, fr.ready === true, changed, revised, discussionAdded, kind))
     );
     this.contextValue = 'file';
     // Clicking a row opens its review panel (the command runs on selection;
@@ -279,24 +287,36 @@ function sessionIcon(s: Session): string {
  *   tree (the GUI renders it with a red "-");
  * - `added` — the file did not exist at the base ref (yellow "+", needs review);
  * - `edit` — both sides exist (yellow pencil).
+ *
+ * The base-side check (git show) is CACHED per (repoRoot, baseRef, path):
+ * tree refreshes happen constantly (file watcher + 10 s scan), and the old
+ * code ran a SYNCHRONOUS git subprocess per file row on every render,
+ * blocking the extension host. The base commit never changes, so one
+ * subprocess per file per session is enough.
  */
 type FileChangeKind = 'deleted' | 'added' | 'edit';
 
+const basePresentCache = new Map<string, boolean>();
 function fileChangeKind(fr: FileReview, repoRoot: string, baseRef: string): FileChangeKind {
   const repoPath = path.join(repoRoot, fr.path);
   const current = fs.existsSync(repoPath);
   if (!current) return 'deleted';
-  let base: string | null = null;
-  try {
-    base = execFileSync('git', ['show', `${baseRef}:${fr.path}`], {
-      cwd: repoRoot,
-      maxBuffer: 256 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).toString('utf8');
-  } catch {
-    base = null; // exit != 0 (or git missing) => file not present at baseRef
+  const key = repoRoot + '\0' + baseRef + '\0' + fr.path;
+  let basePresent = basePresentCache.get(key);
+  if (basePresent === undefined) {
+    try {
+      const base = execFileSync('git', ['show', `${baseRef}:${fr.path}`], {
+        cwd: repoRoot,
+        maxBuffer: 256 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).toString('utf8');
+      basePresent = base !== '';
+    } catch {
+      basePresent = false; // exit != 0 (or git missing) => file not present at baseRef
+    }
+    basePresentCache.set(key, basePresent);
   }
-  if (base === null || base === '') return 'added';
+  if (!basePresent) return 'added';
   return 'edit';
 }
 
@@ -307,20 +327,29 @@ function fileIcon(
   ready: boolean,
   changed: boolean,
   revised: boolean,
+  discussionAdded: boolean,
   agentName: string,
   kind: FileChangeKind
 ): string {
   if (fr.status === 'accepted') return 'check';
-  if (changed) {
-    // The agent changed this file since you last looked: a rocket when it has
-    // actually revised feedback for you, a sparkle otherwise.
-    return revised ? 'rocket' : 'sparkle';
-  }
+  // "AI updated this file" shows ONLY after a revision round: the agent
+  // changed the code in response to your feedback (it set `revised: true` on
+  // the comment / discussion entry it acted on, alongside its reply). On the
+  // INITIAL review it never shows — the file keeps its pencil / + / - icon
+  // until a request-for-revision round completes.
+  if (changed && revised) return 'rocket';
+  // Sent for revision: the file was released to the agent (ready) and still
+  // has open feedback — a distinct "waiting on the AI" state.
+  if (ready && hasOpenFeedback(fr)) return 'sync';
   if (ready) return 'robot';
+  // Open feedback: a CHAT icon so it stands out. When the human LEFT a
+  // discussion after looking at the file (the "already reviewed this" state)
+  // it gets a DISTINCT icon (comment-unresolved — a speech bubble with a
+  // question mark) so the file is recognizable as "I added a discussion"
+  // vs. plain agent review feedback. When it came from the CODE REVIEWER
+  // (the session's agent) it gets the same blue as the "Revise" buttons.
   if (openComments + openDiscussion > 0) {
-    // Open feedback: a CHAT icon so it stands out — and when it came from the
-    // CODE REVIEWER (the session's agent) it gets the same blue as the
-    // "Revise" buttons so review comments are unmistakable at a glance.
+    if (discussionAdded) return 'comment-unresolved';
     const fromReviewer = fr.discussion
       .filter((d) => !d.answered)
       .some((d) => reviewerAuthor(d.author, agentName)) ||
@@ -351,22 +380,21 @@ function reviewerAuthor(author: string, agentName: string): boolean {
 }
 
 /** Icon color: green check when accepted, blue rocket when the agent revised
- *  your feedback, purple sparkle when the agent changed the file, blue robot
- *  when released to the agent, a stand-out blue chat icon for reviewer
- *  comments, a red "-" for deleted files, and stand-out yellow ("+" for new
- *  files, pencil for edits) while awaiting review. */
+ *  your feedback, purple chat when YOU left a discussion after reviewing, a
+ *  red "-" for deleted files, and stand-out yellow ("+" for new files,
+ *  pencil for edits) while awaiting review. */
 function fileIconColor(
   status: FileReview['status'],
   ready: boolean,
   changed: boolean,
   revised: boolean,
+  discussionAdded: boolean,
   kind: FileChangeKind
 ): string {
   if (status === 'accepted') return 'charts.green';
   if (changed && revised) return 'charts.blue';
-  if (changed) return 'charts.purple';
-  if (ready) return 'charts.blue';
   if (kind === 'deleted') return 'charts.red';
+  if (discussionAdded) return 'charts.purple';
   return 'charts.yellow';
 }
 
@@ -465,6 +493,38 @@ class SessionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 let notifyTreeAndPanels: (() => void) | undefined;
 export function setTreeRefreshListener(cb: () => void): void {
   notifyTreeAndPanels = cb;
+}
+
+/**
+ * "Open in a NEW review tab" flag. VS Code gives an extension NO way to read
+ * which modifier keys are held at the moment a tree row is clicked (no
+ * public modifier-key API), so true "shift-click" is approximated: a
+ * keybinding (declared in package.json — `shift` while the sessions view has
+ * focus) runs `afterMath.flagShift`, which arms this flag for a short window
+ * (long enough that the user can release shift before the mouse click lands)
+ * and the row-open command consumes it. A plain click (no flag) always
+ * reuses the single review tab. `afterMath.openFileReviewNewTab` is the
+ * explicit, modifier-free way to open a new tab (palette + right-click menu).
+ */
+let newTabFlag = false;
+let newTabClear: NodeJS.Timeout | undefined;
+function flagShift(): void {
+  newTabFlag = true;
+  if (newTabClear) clearTimeout(newTabClear);
+  newTabClear = setTimeout(() => {
+    newTabClear = undefined;
+    newTabFlag = false;
+  }, 2500);
+}
+/** Consume the new-tab flag (one use per click). */
+function takeNewTabFlag(): boolean {
+  const was = newTabFlag;
+  newTabFlag = false;
+  if (newTabClear) {
+    clearTimeout(newTabClear);
+    newTabClear = undefined;
+  }
+  return was;
 }
 
 function watchedRoots(): string[] {
@@ -571,9 +631,9 @@ export function activate(context: vscode.ExtensionContext): void {
     statusItem.show();
   }
 
-  const openFileReview = (sessionDir: string, _sessionId: string, filePath: string): void => {
+  const openFileReview = (sessionDir: string, _sessionId: string, filePath: string, newTab = false): void => {
     const s = provider.sessions.find((x) => x.dir === sessionDir);
-    if (s) void openReviewPanel(s.dir, s.manifest, filePath);
+    if (s) void openReviewPanel(s.dir, s.manifest, filePath, newTab);
   };
 
   context.subscriptions.push(
@@ -587,8 +647,30 @@ export function activate(context: vscode.ExtensionContext): void {
       if (s.files[0]) void openReviewPanel(s.dir, s.manifest, s.files[0].path);
     }),
     // Row click (the tree items carry this command): open the review panel.
+    // A plain click reuses the single review tab; a fresh tab is requested by
+    // the (bindable) afterMath.flagShift command arming the flag just before,
+    // or explicitly via afterMath.openFileReviewNewTab.
     vscode.commands.registerCommand('afterMath.openFileReview', (sessionDir: string, sessionId: string, filePath: string) => {
-      openFileReview(sessionDir, sessionId, filePath);
+      openFileReview(sessionDir, sessionId, filePath, takeNewTabFlag());
+    }),
+    // Explicit "open in a new tab" (right-click menu / palette): no modifier
+    // key required, so it works even where shift-click can't be detected.
+    // From the right-click menu VS Code passes the TreeItem; from the palette
+    // (or a future direct call) it passes the three path strings.
+    vscode.commands.registerCommand('afterMath.openFileReviewNewTab', (first?: unknown, second?: unknown, third?: unknown) => {
+      if (first instanceof FileItem) {
+        openFileReview(first.session.dir, first.session.manifest.session, first.fr.path, true);
+        return;
+      }
+      if (typeof first === 'string' && typeof second === 'string' && typeof third === 'string') {
+        openFileReview(first, second, third, true);
+      }
+    }),
+    // Arms the "open in new tab" flag for a short window; the user binds this
+    // to a key they press while clicking a row (VS Code can't read the shift
+    // key at click time, so this is the closest available equivalent).
+    vscode.commands.registerCommand('afterMath.flagShift', () => {
+      flagShift();
     }),
     // Right-click a file row: set its status.
     vscode.commands.registerCommand('afterMath.file.setStatus', (item: vscode.TreeItem, status: string) => {

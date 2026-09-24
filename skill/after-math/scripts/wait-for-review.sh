@@ -69,9 +69,9 @@ helper() {
         if (!releasable(r)) continue;
         files.push({
           path: r.path,
-          // comments[].resolved is always true here: the agent addresses each
-          // one and marks it resolved on re-submission.
-          comments: (r.comments || []).filter((c) => !c.resolved).map((c) => ({ ...c, resolved: true })),
+          // Open comments only — `resolved` is left exactly as on disk
+          // (false here): only the human marks comments resolved.
+          comments: (r.comments || []).filter((c) => !c.resolved),
           discussion: (r.discussion || []).filter((d) => !d.answered),
         });
       }
