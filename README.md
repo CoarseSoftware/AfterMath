@@ -46,17 +46,6 @@ The whole loop is file-based (a gitignored `.aftermath/` folder in your project)
 
   (or download `after-math-<version>.vsix` from [Releases](https://github.com/CoarseSoftware/AfterMath/releases) and run the same command on it).
 
-- **From the VS Code Marketplace** — not yet published. Publishing requires a free Microsoft publisher account: register at [marketplace.visualstudio.com](https://marketplace.visualstudio.com/manage/publishers), then from `extensions/review-gui`:
-
-  ```bash
-  npm install
-  npm run build
-  npx @vscode/vsce login <publisher-id>   # one-time browser login
-  npx @vscode/vsce publish
-  ```
-
-  After that, anyone can install it with `ext install <publisher-id>.after-math`. Until then, the `.vsix` command above is the supported path.
-
 **2. The AI skill** (teaches the agent the submit → wait → fix → finalize workflow)
 
 ```bash
